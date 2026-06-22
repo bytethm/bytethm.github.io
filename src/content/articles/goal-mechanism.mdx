@@ -1,0 +1,147 @@
+---
+title: "Goal 机制：让 Agent 明确地停下来"
+description: "Goal 的关键不是多一个状态字段，而是把运行结束条件从“模型没有动作”改成一条明确的退出协议。"
+published: 2026-06-18
+status: draft
+kind: design-note
+series: agent-runtime
+tags:
+  - Agent Runtime
+  - Goal
+  - Tool Use
+  - ReAct
+readingTime: "11 min"
+hero: "/assets/goal-stop-predicate.png"
+---
+
+一个 Agent 刚刚写出一段完整回答，界面看起来像是结束了。但如果任务要求“测试全部通过”“所有待办完成”或“找到明确阻塞原因”，这段回答并不能证明任何事。
+
+普通 Agent 仍然会停。不是因为它已经验证了目标，而是因为它这一轮没有再调用工具。模型的自然收尾被运行时解释为任务结束。
+
+Goal 机制要改的就是这条默认解释。它不首先是一块显示 active、blocked、complete 的状态面板；它是一条**退出协议**：当一轮工作自然结束后，运行时依据什么证据决定继续，依据什么证据允许停止。
+
+左图检查 `Tool call?`：没有工具调用，即停止。右图检查 `Goal terminal?`：只要目标尚未进入终态，就继续；一段文本输出本身不构成终止。
+
+## 自然结束到底是什么意思
+
+典型 ReAct loop 的形状很简单：
+
+```text
+response = model(messages)
+
+if response.has_tool_call:
+  run_tools(response.tool_calls)
+  continue
+
+return response
+```
+
+`!has_tool_call` 同时表达了两件不同的事：模型这一轮不想再行动，外层运行也该停止。一次性问答里，这个合并很合理。用户要的是回答，模型不再调用工具通常就意味着回答已经成形。
+
+长任务里，这个合并开始失效。没有工具调用只说明模型暂时没有行动意图，不说明验收条件已经满足。模型可以忘记待办、跳过验证、误判测试结果，也可以在缺少证据时写出极其完整的结论。
+
+所以问题不该是“模型为什么不继续”。更准确的问题是：**模型没有动作时，系统凭什么允许它结束？**
+
+## Goal 改写的是退出协议
+
+把一轮 Agent 工作和一个受控运行是否结束拆开，结构会更清楚：
+
+```text
+while true:
+  result = run_agent_turn(input)
+
+  if stop_predicate(result, state, evidence):
+    return result
+
+  input = continuation(result, state, evidence)
+```
+
+`run_agent_turn()` 可以是一次 ReAct，也可以是一个 Team、Graph 或 Remote Agent 调用。Goal 不规定内部怎么工作；它改变外层的 `stop_predicate`。
+
+这也是 Goal 最容易被误读的地方。它不是“给每个 Agent 增加一个目标对象”，而是把某个运行边界的默认停止条件从：
+
+```text
+stop = no_more_tool_calls
+```
+
+改成：
+
+```text
+stop = terminal_condition_satisfied
+```
+
+这个边界必须说清楚。一个 Agent extension 可以控制该 Agent invocation 是否继续；一个 session controller 可以控制 thread 是否继续；只有放在任务级 orchestrator 上，Goal 才能关闭整个任务。状态名相同，不代表控制范围相同。
+
+## 四种让运行停止的方式
+
+Goal 是显眼的产品名字，但退出协议并不只有一种实现。
+
+| 形态 | 停止条件 | 证据来自哪里 | 主要代价 |
+| --- | --- | --- | --- |
+| 自然 ReAct | `!has_tool_call` | 模型本轮没有请求动作 | 延迟低，但相信模型的自然收尾 |
+| 终态契约 | `contract_satisfied` | 明确的完成 / 阻塞声明，或受约束状态满足 | 默认继续，需要定义受控出口 |
+| 外部评估 | `evaluator(condition, transcript)` | evaluator 对已有证据的判断 | 条件必须能从可见证据判断 |
+| 外部校验 | `verifier_passed` | 测试、命令、规则或自定义 verifier | 证据更硬，成本与失败处理更高 |
+
+它们可以组合。系统可以要求模型先声明完成，再运行测试；也可以用 evaluator 审查自然语言目标，同时以超时、预算或最大轮数作为安全阀。关键不是使用了哪个名字，而是谁拥有停止权、它依赖什么证据。
+
+### 终态契约：默认继续，显式退出
+
+终态契约反转了普通 ReAct 的默认值。模型不调用工具不再足以停止；只有完成或阻塞被明确声明，运行时才关闭这条持续推进规则。
+
+Codex Goal 是 thread 级的例子：目标 active 时，runtime 会在 thread 空闲后继续调度下一轮；只有更新到终态，才清除持续推进规则。关键不是保存 goal，而是 active 后的 `continue_if_idle()`，见 [`runtime.rs`](https://github.com/openai/codex/blob/main/codex-rs/ext/goal/src/runtime.rs) 与 [`spec.rs`](https://github.com/openai/codex/blob/main/codex-rs/ext/goal/src/spec.rs)。
+
+tRPC-Agent-Go 的 `todoenforcer` 更窄：只要仍有 pending 或 in-progress todo，最终回答就会被拦下并继续；全部完成，或通过 blocker 声明退出，才允许收尾。
+
+两者粒度不同，思想相同：**默认继续，显式终止。**这不是模型更努力，而是运行时拒绝把沉默当完成。
+
+### 外部评估：让判断器读取证据
+
+[Claude Code 的 Goal 文档](https://code.claude.com/docs/en/goal) 描述了另一条路线：每回合结束后，evaluator 根据对话中已经出现的内容判断条件是否满足，并给出简短原因；满足或用户清除目标后才停止。
+
+这里的 evaluator 可以是另一个模型、规则或结果汇总器。它的价值不是“又多了一次模型调用”，而是主 Agent 的自然收尾不再拥有终止权。
+
+它也有明确边界：判断器只能消费已经出现的证据。Claude Code 文档特别说明 evaluator 不会独立执行命令或读取文件。因此“所有测试通过”之类的条件成立，是因为测试输出已经进入 transcript，而不是 evaluator 凭空验证了环境。
+
+### 外部校验：让代码决定能否停下
+
+Ralph 式循环把停止条件做得更硬：每一轮之后先校验；校验失败就把原因反馈回去并继续。测试命令、规则或自定义 verifier 都可以成为停止谓词的一部分，轮数上限则负责防止无限运行。
+
+这里需要区分声明与证据。completion promise 仍然只是模型输出；只有测试、命令或可复现规则进入停止谓词，终止证据才真正变硬。把“模型说完成了”直接等同于“已经验证”，只是换一种形式相信模型自述。
+
+## 状态记录事实，协议赋予控制语义
+
+active、blocked、complete 这些状态当然有价值，但它们不是机制本身。
+
+`blocked` 不天然等于停止，`complete` 也不天然可信。只有运行时定义了“谁可以修改状态、哪些状态满足停止条件、停止失败时怎样继续、什么安全阀可以强制结束”之后，状态才获得控制语义。
+
+这也是为什么一开始就讨论字段设计容易跑偏。状态记录“现在是什么”；退出协议决定“还能不能停”。前者可以不断扩展，后者必须保持明确。
+
+## 文本流出，不代表任务结束
+
+流式文本解决的是输出边界：用户此刻看到了什么。退出协议解决的是运行边界：系统是否还要继续。它们不是同一个开关。
+
+因此，受控运行可以先输出一段阶段性解释，再继续推进 active goal。普通聊天里，完整回答通常就是结束；Goal 模式下，它只是一次可见结果。界面应当把“仍在运行”表达清楚，但运行时没有理由因为文本已经发出就放弃继续。
+
+## 编排不能替代退出协议
+
+Graph、Loop Agent、Team、A2A 处理的是谁做什么、怎样传递控制和结果。它们可以实现 `run_agent_turn()`，但并不自动给出外层什么时候停止。
+
+一个 Graph 可以在自身节点都走完后自然结束，也可以被终态契约包住，或在每轮后接受 evaluator / verifier 检查。把“内部怎么推进”和“外层能否关闭”混为一谈，才会把多 Agent 编排误当作 Goal 的替代品。
+
+这也是[任务级编排](../task-orchestration/)需要单独讨论的原因：复杂任务还要决定任务程序从哪里来、谁负责推进。Goal 只回答其中最后一个问题，且必须先明确它挂在哪个运行边界上。
+
+## 设计 Goal 前先写出退出规则
+
+不要先定义状态字段或工具名称。先写出这条规则：
+
+```text
+谁计算 stop_predicate？
+它读取哪些证据？
+它不成立时，下一轮收到什么 continuation？
+用户取消、预算、超时和最大轮数如何强制结束？
+```
+
+答案可以是终态工具、todo contract、evaluator、verifier，或者它们的组合。Goal 只是这组设计空间中最醒目的名字。
+
+真正需要被设计的，是在 Agent 停下来之前，系统到底要求它证明什么。

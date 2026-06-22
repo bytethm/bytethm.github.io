@@ -1,0 +1,26 @@
+---
+import { getArticleSlug } from '@/utils/articles';
+
+const { article } = Astro.props;
+const slug = getArticleSlug(article);
+const date = article.data.published.toLocaleDateString('zh-CN', {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+---
+
+<a class="article-card" href={`/articles/${slug}/`}>
+  <div>
+    <div class="meta-row">
+      <span>{date}</span>
+      {article.data.readingTime && <span>{article.data.readingTime}</span>}
+      {article.data.status === 'draft' && <span class="draft-badge">Draft</span>}
+    </div>
+    <h3>{article.data.title}</h3>
+    <p>{article.data.description}</p>
+  </div>
+  <div class="tag-row" aria-label="Tags">
+    {article.data.tags.slice(0, 3).map((tag) => <span class="tag">{tag}</span>)}
+  </div>
+</a>

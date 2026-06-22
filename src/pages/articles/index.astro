@@ -1,0 +1,24 @@
+---
+import { getCollection } from 'astro:content';
+import ArticleCard from '@/components/ArticleCard.astro';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+
+const articles = (await getCollection('articles')).sort(
+  (left, right) => right.data.published.valueOf() - left.data.published.valueOf(),
+);
+---
+
+<BaseLayout title="Articles" description="Agent engineering articles and design notes.">
+  <section class="container listing">
+    <div class="section-header">
+      <div>
+        <div class="eyebrow">Archive</div>
+        <h1>Articles</h1>
+      </div>
+      <p>普通文章、短系列和机制判断先统一放在这里。主题可以很宽，入口保持清楚。</p>
+    </div>
+    <div class="article-grid">
+      {articles.map((article) => <ArticleCard article={article} />)}
+    </div>
+  </section>
+</BaseLayout>

@@ -1,0 +1,37 @@
+---
+import { getCollection } from 'astro:content';
+import ArticleCard from '@/components/ArticleCard.astro';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+
+const articles = (await getCollection('articles')).sort(
+  (left, right) => right.data.published.valueOf() - left.data.published.valueOf(),
+);
+const latest = articles.slice(0, 6);
+---
+
+<BaseLayout>
+  <section class="container hero">
+    <div>
+      <div class="eyebrow">bytethm.github.io</div>
+      <h1>Notes</h1>
+      <p>一些文章，一些研究，一些还在形成中的判断。</p>
+      <div class="hero-actions">
+        <a class="button primary" href="/articles/">Read articles</a>
+        <a class="button" href="/series/">Explore series</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="container section">
+    <div class="section-header">
+      <div>
+        <div class="eyebrow">Latest</div>
+        <h2>最新文章</h2>
+      </div>
+      <p>最近写下来的东西。</p>
+    </div>
+    <div class="article-grid">
+      {latest.map((article) => <ArticleCard article={article} />)}
+    </div>
+  </section>
+</BaseLayout>

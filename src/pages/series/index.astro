@@ -1,0 +1,65 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+
+const articles = await getCollection('articles');
+const seriesMap = new Map();
+
+for (const article of articles) {
+  if (!article.data.series) continue;
+  const series = article.data.series;
+  const entry = seriesMap.get(series) ?? {
+    series,
+    count: 0,
+    latest: article.data.published,
+    tags: new Set(),
+  };
+  entry.count += 1;
+  if (article.data.published > entry.latest) {
+    entry.latest = article.data.published;
+  }
+  for (const tag of article.data.tags) {
+    entry.tags.add(tag);
+  }
+  seriesMap.set(series, entry);
+}
+
+const seriesList = Array.from(seriesMap.values()).sort(
+  (left, right) => right.latest.valueOf() - left.latest.valueOf(),
+);
+
+function formatTitle(series) {
+  return String(series)
+    .split('-')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+---
+
+<BaseLayout title="Series" description="Topic series and reading paths.">
+  <section class="container listing">
+    <div class="section-header">
+      <div>
+        <div class="eyebrow">Reading Paths</div>
+        <h1>Series</h1>
+      </div>
+      <p>系列页只是阶段性组织方式。主题足够成熟后，可以升级为 books 或独立项目。</p>
+    </div>
+    <div class="article-grid">
+      {seriesList.map((entry) => (
+        <a class="article-card" href={`/series/${entry.series}/`}>
+          <div>
+            <div class="meta-row">
+              <span>{entry.count} article{entry.count > 1 ? 's' : ''}</span>
+            </div>
+            <h3>{formatTitle(entry.series)}</h3>
+            <p>围绕同一主题持续沉淀的文章集合。</p>
+          </div>
+          <div class="tag-row">
+            {Array.from(entry.tags).slice(0, 3).map((tag) => <span class="tag">{tag}</span>)}
+          </div>
+        </a>
+      ))}
+    </div>
+  </section>
+</BaseLayout>

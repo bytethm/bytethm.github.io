@@ -1,0 +1,15 @@
+---
+import { navItems, site } from '@/config/site';
+---
+
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="/">
+      <span>{site.title}</span>
+      <small>notes</small>
+    </a>
+    <nav class="site-nav" aria-label="Primary navigation">
+      {navItems.map((item) => <a href={item.href}>{item.label}</a>)}
+    </nav>
+  </div>
+</header>

@@ -64,7 +64,7 @@ messages / tools JSON → chat template → token IDs
 
 因此，同样使用 OpenAI SDK、同样调用 `/v1/chat/completions` 或 `/v1/responses` 的两个服务，仍可能在以下方面明显不同：
 
-- system / developer 指令优先级；
+- system / developer 指令的优先级与转写策略；
 - 工具是否调用、调用哪个工具、参数是否稳定；
 - JSON / schema 输出稳定性；
 - thinking / reasoning 输出方式；
@@ -72,6 +72,10 @@ messages / tools JSON → chat template → token IDs
 - 首 token 延迟（TTFT）、token 间延迟（ITL）；
 - Prefix Cache 命中与多租户公平性；
 - 安全边界、拒答方式与默认产品策略。
+
+`developer` 在新 API 里已经不算常见写法，但它并没有消失。OpenAI Chat Completions 参考中仍有 `ChatCompletionDeveloperMessageParam`，并说明 o1 及更新模型用 `developer` message 替代旧的 `system` message 用法；Responses API 的 input role 也包含 `developer`，且 `instructions` 被描述为插入模型上下文的 system 或 developer message。[S19][S20]
+
+但这仍然只是 API 对象层的 role。进入具体开源 serving 时，它可能被原样交给模型模板，也可能被运行时转写。vLLM 当前会检测 chat template 是否包含 `developer` role；模板不支持时，会把 `developer` 转成 `system` 再渲染。[S21]
 
 **可操作原则：**把“OpenAI-compatible”视为**传输与对象结构兼容**，而不是**行为同构合同**。
 
@@ -1797,3 +1801,6 @@ serving configuration
 - [S16: vLLM Responses API adapter and renderer source snapshot](https://github.com/vllm-project/vllm/tree/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/entrypoints/openai/responses)
 - [S17: vLLM quantization documentation snapshot](https://github.com/vllm-project/vllm/tree/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/docs/features/quantization)
 - [S18: vLLM speculative decoding documentation snapshot](https://github.com/vllm-project/vllm/tree/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/docs/features/speculative_decoding)
+- [S19: OpenAI Chat Completions Create API Reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/)
+- [S20: OpenAI Responses Create API Reference](https://developers.openai.com/api/reference/resources/responses/methods/create/)
+- [S21: vLLM developer-role conversion in HF renderer](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/renderers/hf.py#L454-L724)

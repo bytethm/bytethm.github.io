@@ -1,0 +1,502 @@
+---
+title: "工具编排：让模型安排调用，而不是搬运数据"
+description: "代码不是为了让 Agent 变成脚本解释器，而是把工具间的控制逻辑和中间数据从模型上下文移到受控运行时。"
+published: 2026-06-25
+status: draft
+kind: design-note
+series: agent-runtime
+tags:
+  - Agent Runtime
+  - Tool Calling
+  - CodeAct
+  - Context
+readingTime: "18 min"
+hero: "/assets/tool-code-orchestration-hero.png"
+---
+
+> **版本快照：2026-06-25**
+>
+> **用途：**Agent 工具调用、上下文治理与运行时设计讨论。
+>
+> **阅读规则：**本文讨论的是一类机制，不讨论某个具体 PR。CodeAct、programmatic tool calling、code mode 这些名字背后，真正值得拆开的是：模型、工具、代码运行时和宿主进程之间，谁负责控制，谁负责搬运数据，谁负责守住能力边界。
+
+---
+
+## 问题从哪里开始
+
+大多数 Agent 的工具调用默认是单步的：
+
+```text
+模型决定调用工具 A
+→ 运行时执行工具 A
+→ 工具 A 的结果进入模型上下文
+→ 模型再决定调用工具 B
+→ 工具 B 的结果再次进入模型上下文
+```
+
+这个范式很自然。模型负责观察、判断、选择下一步；工具负责拿数据或做动作；运行时负责把工具结果塞回对话，让模型继续推理。
+
+只要工具结果很小，这个模式没有问题。天气查询、一个订单状态、一次计算结果，直接放进上下文，模型能读、能解释、也能继续调用下一个工具。
+
+问题出现在另一类任务里：工具返回的是一批搜索结果、一个大 JSON、一组日志、一页网页、几十个候选商品、数百条交易记录，或者多次查询之后才能筛出来的中间集合。此时模型上下文开始承担两种职责：
+
+1. **控制面**：决定下一步该调用什么。
+2. **数据面**：保存并转运工具之间的大量中间结果。
+
+真正昂贵的往往不是“模型想一想下一步”，而是“模型为了想下一步，被迫读完一大坨中间数据”。工具调用越多，中间结果越大，这个问题越明显。
+
+所以工具编排要解决的第一性问题不是“怎样让模型更会调用工具”，而是：
+
+> 前一个工具的结果，能不能不经过模型上下文，就被后一个步骤消费？
+
+---
+
+## 一页结论
+
+**代码化工具编排的核心价值，不是代码执行本身，而是把工具之间的数据搬运和控制逻辑，从模型上下文移到一个受控运行时。**
+
+模型仍然负责高层判断：要查什么、怎样筛选、什么时候停止、最后给用户什么结论。但模型不必逐字阅读所有中间结果，也不必在上下文里充当临时数据库。
+
+可以把三种形态放在一起看：
+
+| 形态 | 中间结果在哪里 | 模型负责什么 | 适合场景 |
+| --- | --- | --- | --- |
+| 直接工具调用 | 模型上下文 | 每一步选择和读取结果 | 少量工具、小结果、高语义判断 |
+| 结果过滤 / pipe | 过滤器内部，最终片段进上下文 | 选择工具与过滤表达式 | 大文本、大 JSON 的局部抽取 |
+| 代码化工具编排 | 代码运行时变量中 | 生成编排程序与解释最终结果 | 循环、分支、聚合、类型转换、多工具依赖 |
+
+![三种工具结果处理形态：直接工具调用、结果过滤和代码化工具编排。](/assets/tool-code-orchestration-patterns.png)
+
+*图 1. 直接工具调用把大结果带回模型上下文；结果过滤先压缩单个工具输出；代码化工具编排则把循环、分支和聚合留在运行时，只把最终紧凑结果交回模型。*
+
+代码之所以自然，是因为工具之间的连接不是简单的字符串拼接。真实任务里经常会出现：
+
+- 前一个工具返回列表，后一个工具需要逐项查询；
+- 前一个工具返回宽 JSON，后一个工具只需要其中几个字段；
+- 需要先排序、去重、分组，再决定调用哪个工具；
+- 需要遇到第一个满足条件的结果就提前停止；
+- 需要把多个工具结果合并成一个紧凑结构，再交给模型解释。
+
+这些事情用自然语言上下文也能做，但代价是把数据面拖回模型。用代码做，则更像把模型从“搬运工”还原成“编排者”。
+
+---
+
+## 直接工具调用的隐含成本
+
+传统 ReAct 循环可以写成这样：
+
+```text
+while true:
+  action = model(context)
+
+  if action is tool_call:
+    result = run_tool(action)
+    context.append(result)
+    continue
+
+  return action.final_answer
+```
+
+这段循环的优点是简单、统一、可解释。它的缺点也来自同一个地方：每次工具结果都会进入 `context`，成为下一轮模型输入的一部分。
+
+假设任务是“找出符合条件的商品，检查库存，然后生成报价”。直接工具调用通常会变成：
+
+```text
+search_catalog(query)
+→ 100 个候选商品进入模型上下文
+
+get_inventory(sku_1)
+→ 库存结果进入模型上下文
+
+get_inventory(sku_2)
+→ 库存结果进入模型上下文
+
+...
+
+create_quote(selected_items)
+→ 报价结果进入模型上下文
+```
+
+模型在这里做了两件不同性质的事。它当然需要理解用户需求，也需要决定筛选规则。但它不应该被迫读取 100 个候选商品的完整描述，再在上下文里手工维护“哪些 SKU 已经查过、哪些库存不足、哪些可以报价”。
+
+这不是单纯的上下文成本问题。上下文越长，注意力越分散，工具结果越多，模型越容易遗漏约束、重复调用、错误地复制字段，或者把一个中间结果当成最终事实。
+
+---
+
+## 第一层缓解：过滤结果，而不是搬运全部
+
+最直接的缓解方式是：工具结果仍然回来，但先经过一段过滤逻辑，模型只看到压缩后的片段。
+
+```text
+tool result
+→ grep / head / jq / selector
+→ compact result
+→ model context
+```
+
+这类能力可以非常有效。比如网页抓取、日志检索、搜索结果筛选、大 JSON 提取，很多时候并不需要模型看到完整原文，只需要看到命中的几行、某几个字段、排序后的前几个元素。
+
+它的关键是把“粗大的工具输出”变成“可消费的局部证据”。
+
+例如：
+
+```text
+web_fetch(url)
+→ jq ".items[] | select(.score > 0.8) | {title, url, score}"
+→ top 10 compact items
+```
+
+但这仍然不是完整的工具编排。因为第二步并不是另一个原生业务工具，而是一段面向文本或 JSON 的过滤器。它适合处理单个工具的大结果，不适合表达更复杂的跨工具依赖。
+
+一旦问题变成：
+
+```text
+先搜索候选项
+再对每个候选项查库存
+库存足够时再查价格
+价格满足条件才加入报价
+凑够 N 个就停止
+最后生成一个结构化摘要
+```
+
+过滤器就开始不够用了。这里需要变量、循环、分支、提前停止、异常处理和结构转换。换句话说，需要一段程序。
+
+---
+
+## 为什么是代码，而不是更复杂的工具 schema
+
+可以继续增强工具 schema，让模型输出更复杂的 JSON：
+
+```json
+{
+  "steps": [
+    {"tool": "search_catalog", "args": {"query": "..." }},
+    {"tool": "get_inventory", "for_each": "$.results[*].sku"},
+    {"tool": "create_quote", "args": {"items": "$.available[*]"}}
+  ]
+}
+```
+
+这看起来也像编排。但它很快会重造一门不成熟的 DSL：变量怎么引用、错误怎么处理、循环如何中断、条件如何表达、结果如何转换、调试信息如何呈现，都要重新定义。
+
+代码的优势不是“更炫”，而是它已经是成熟的控制语言：
+
+```python
+items = await call_tool("search_catalog", query=query)
+
+selected = []
+for item in items:
+    stock = await call_tool("get_inventory", sku=item["sku"])
+    if stock["available"] <= 0:
+        continue
+
+    selected.append({
+        "sku": item["sku"],
+        "name": item["name"],
+        "qty": min(stock["available"], requested_qty),
+    })
+
+    if len(selected) == 3:
+        break
+
+quote = await call_tool("create_quote", items=selected)
+return {
+    "selected": selected,
+    "quote_id": quote["id"],
+    "total": quote["total"],
+}
+```
+
+这里有一个容易被忽略的点：模型不需要学习一门新 DSL。它只需要知道一件额外的事：在这段代码里，可以用 `call_tool(name, args)` 调用被允许的宿主工具。剩下的变量、列表、条件、循环、异常处理，都是模型在代码训练中已经熟悉的东西。
+
+这也是 CodeAct 论文和 Claude programmatic tool calling 文档共同指向的方向：让模型通过可执行代码表达动作，而不是每一步都输出一个固定格式的工具调用 JSON。[CodeAct 论文](https://arxiv.org/abs/2402.01030)将它描述为用可执行 Python 代码统一 Agent action space；[Claude 文档](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling)则强调模型可以在 code execution 容器中写代码调用工具，减少多工具流程的往返和上下文消耗。
+
+---
+
+## 类型不匹配时，代码承担适配层
+
+工具编排最现实的卡点之一是类型不匹配。
+
+工具 A 的输出不一定正好是工具 B 的输入：
+
+```text
+search_catalog 输出：
+[
+  {"sku": "A-1", "title": "...", "score": 0.91, "attrs": {...}},
+  {"sku": "B-2", "title": "...", "score": 0.84, "attrs": {...}}
+]
+
+get_inventory 输入：
+{"sku": "A-1", "warehouse": "CN-SH"}
+```
+
+如果让模型在上下文里搬运，它需要读完整输出、挑字段、拼参数、再发起下一次工具调用。字段越多，候选越多，越容易出错。
+
+代码化编排把这件事变成普通数据转换：
+
+```python
+for product in products:
+    inv = await call_tool(
+        "get_inventory",
+        sku=product["sku"],
+        warehouse=preferred_warehouse,
+    )
+```
+
+这不是魔法。它依赖几个工程前提：
+
+- 工具输入最好有明确 JSON Schema；
+- 工具输出最好也是稳定的 JSON 兼容结构；
+- 大型原始结果不应被无脑 `print` 或 `return`；
+- 二进制、大文件、长文本更适合返回 handle、摘要或分页游标；
+- 运行时要在宿主侧校验 `call_tool` 的入参与出参，不能只相信生成代码。
+
+也就是说，代码解决的是“怎样胶合”，不是“怎样让坏接口自动变好”。如果工具本身没有清晰契约，代码只是把不确定性换了一个地方。
+
+---
+
+## 工程上怎么打通宿主工具
+
+如果 Agent 框架和胶水代码使用同一种语言，比如都是 Python 或 JavaScript，把生成代码放进某个解释器里运行，技术上并不难。但这并不等于应该把代码直接嵌入 Agent 进程。
+
+模型生成代码相对宿主进程应当被视为不可信。即使没有恶意，它也可能死循环、占满内存、误删文件、读取环境变量，或者因为一个普通 bug 把 Agent 进程拖垮。
+
+更通用的结构是：宿主进程和代码运行时分离。
+
+```text
+                 model
+                   |
+                   v
+          execute_code / tool_code
+                   |
+                   v
+        host process / agent runtime
+                   |
+          starts or calls runtime
+                   |
+                   v
+        guest code runtime / sandbox
+                   |
+          call_tool(name, args)
+                   |
+                   v
+        host validates and runs tool
+```
+
+![生成代码通过 RPC 调用宿主工具网关，而不是直接访问原生工具。](/assets/tool-code-orchestration-rpc.png)
+
+*图 2. 胶水代码运行在独立的 guest runtime 中，`call_tool` 看起来像本地函数调用，底层实际是向宿主工具网关发起请求；真实工具仍由宿主进程执行。*
+
+如果宿主是 Go、.NET、Rust，而胶水代码是 Python，这条边界就更必要了。Python 代码不可能直接调用 Go 内存里的函数，也不应该直接拿到宿主进程的内部对象。它能做的是通过一条协议向宿主发起请求。
+
+最小协议可以很朴素：
+
+```text
+guest stdout:
+{"type":"tool_call","id":"1","name":"search_catalog","args":{"query":"camera"}}
+
+host stdin:
+{"type":"tool_result","id":"1","result":[...]}
+```
+
+这本质上就是 RPC。所谓“远程”不一定是网络远端，也可以是进程间通信：宿主进程 fork 一个子进程，双方通过 stdio 交换 JSON 消息。子进程里的 `await call_tool("search_catalog", query="camera")` 看起来像普通函数调用，底层实际是一次跨进程请求；宿主收到请求后，按原来的工具注册、权限、schema、审计和回调机制执行真实工具，再把结果返回给子进程。
+
+Microsoft Agent Framework 的 CodeAct 设计记录也采用了类似抽象：模型看到单个 `execute_code` 工具，生成的代码通过 `call_tool(...)` 访问 provider-owned host tools；实现上强调 backend 负责隔离，框架负责能力配置、审批、遥测和工具调用语义。[Microsoft Agent Framework ADR](https://github.com/microsoft/agent-framework/blob/main/docs/decisions/0024-codeact-integration.md)
+
+关键不在 stdio 本身。stdio 只是最容易落地的一种传输。后续也可以换成 HTTP、Unix domain socket、容器服务、microVM、托管 sandbox 或平台原生 callback。框架要守住的是抽象：
+
+```text
+generated code
+→ call_tool request
+→ host tool gateway
+→ schema validation / approval / tracing
+→ native tool execution
+→ structured result
+→ generated code continues
+```
+
+---
+
+## 为什么不让代码直接调 HTTP API
+
+一个常见质疑是：既然模型已经会写代码，为什么不直接让它写 HTTP 请求调用业务 API？
+
+这在 demo 里当然能跑。问题是它绕过了 Agent 工具系统里最有价值的部分。
+
+业务 API 通常需要凭证、权限、重试、限流、审计、幂等、脱敏、错误归一化和领域参数校验。如果生成代码直接拿 HTTP client 去调 API，就意味着这些能力要么暴露到 sandbox 里，要么被模型重新实现一遍。
+
+工具不是 HTTP API 的低配包装。工具是宿主给模型开放的能力边界：
+
+- 工具决定哪些能力可以被模型使用；
+- schema 决定入参和出参怎样被约束；
+- approval 决定敏感动作是否需要确认；
+- tracing 决定谁调用了什么、结果是什么；
+- retry / timeout / rate limit 决定失败怎样收束；
+- adapter 决定内部 API、凭证和复杂协议不直接暴露给模型。
+
+因此，代码化工具编排不是“让 AI 写代码绕过工具”。恰好相反，它应该让生成代码只能通过 `call_tool` 进入受控工具网关。
+
+```text
+不推荐：
+generated code -> requests.post("https://api.example/...", headers=auth_headers)
+
+推荐：
+generated code -> call_tool("create_quote", items=[...])
+                -> host-owned tool adapter
+                -> backend API
+```
+
+![生成代码只能通过工具网关访问被批准的能力，不能绕过工具系统直接访问文件、shell、网络或凭证。](/assets/tool-code-orchestration-boundary.png)
+
+*图 3. 代码运行时的能力边界应该由工具网关收口：允许它编排被批准的领域工具，而不是直接访问 HTTP、文件系统、shell、环境变量或网络。*
+
+这条边界一旦破掉，工具编排就会退化成“把内部系统暴露给一段临时代码”。那不是 Agent 能力增强，而是能力边界丢失。
+
+---
+
+## 运行环境和依赖不是细节
+
+代码运行在哪里，决定了这套机制能不能进入生产。
+
+最轻量的实现可以在本地启动一个 Python 子进程。这适合开发、示例、可信环境，或者已经由外层容器和权限系统隔离好的场景。但本地进程不是安全 sandbox。它通常能看到宿主文件系统、网络、环境变量和机器资源，除非额外做了限制。
+
+生产环境更常见的选择是：
+
+- 固定镜像的容器；
+- microVM / Wasm / Hyperlight 一类隔离运行时；
+- 内部托管的代码执行服务；
+- 云厂商提供的 code execution container；
+- 完全自管的 remote sandbox。
+
+第三方依赖也要按同一条原则处理：不要让生成代码运行时随意 `pip install`。更稳的方式是预构建运行环境，把允许的库和版本固定下来。需要 pandas、numpy、日期库、JSON 工具，就放进镜像或 sandbox 基础环境；不需要的 import，直接拒绝。
+
+代码运行时的能力应该是显式配置出来的：
+
+```text
+runtime capabilities:
+- language: python
+- max wall time: 5s
+- max memory: 256MB
+- filesystem: disabled or mounted workspace
+- network: disabled or allowlisted
+- imports: allowlisted
+- tools: search_catalog, get_inventory, create_quote
+```
+
+这样模型看到的是简单心智模型：写 Python，用 `call_tool` 调工具，返回紧凑结果。工程系统看到的是另一层：每一次代码执行都有资源边界、能力边界和观测边界。
+
+---
+
+## 不要把所有工具都塞进去
+
+代码编排需要一个独立的工具 registry，而不是自动继承 Agent 直接可见的所有工具。
+
+原因很简单：直接工具和代码内工具不是同一种模型侧入口。
+
+直接工具适合让模型在每一步之后重新观察和决策。代码内工具适合在一次受控执行中完成循环、分支和聚合。如果同一个能力同时以两种方式暴露，模型会看到两条路径：
+
+```text
+直接调用 get_inventory
+或
+execute_code 里 await call_tool("get_inventory", ...)
+```
+
+这不一定错误，但它会让模型难以判断什么时候应该用哪条路径。更严重的是，一些工具根本不适合放进代码运行时：
+
+- 需要用户交互或审批的工具；
+- transfer / agent handoff 这类改变控制权的工具；
+- workspace shell、stdin、kill session 这类通用执行工具；
+- 能再次启动代码执行的工具；
+- 大范围文件、网络或凭证访问工具；
+- 输出不稳定、无 schema、强依赖自然语言解释的工具。
+
+代码内工具应该尽量是领域能力：搜索、查询、计算、创建草稿、检查库存、读取受限记录、生成报价。它们的共同点是：输入输出清晰，适合被代码当作函数调用。
+
+---
+
+## 什么时候不应该用代码编排
+
+代码化工具编排不是替代所有 workflow。
+
+如果流程稳定、可复用、强约束，应该直接写业务代码或固定 workflow。比如每天跑的账单校验、标准审批流、确定的 ETL 任务，不需要每次让模型重新生成一段脚本。
+
+如果只是一次工具调用，或者两三个小结果之间需要高语义判断，直接工具调用更简单。
+
+如果核心问题是从大文本或大 JSON 中抽几行，过滤管道通常更便宜。
+
+代码编排更适合夹在中间的区域：
+
+```text
+流程不是完全固定
+但局部操作又明显可以程序化
+并且中间结果较大，不值得全部进模型上下文
+```
+
+典型信号包括：
+
+- 同一个工具需要循环调用多次；
+- 是否调用后续工具取决于前面结果；
+- 需要把多个工具结果聚合成一个小结论；
+- 中间结果很大，但最终只需要一个紧凑结构；
+- 模型容易在上下文里丢字段、漏约束或重复调用。
+
+---
+
+## 设计这类能力时，先问五个问题
+
+第一，模型看到的入口是什么？
+
+如果入口叫 `execute_code`，它容易和通用代码执行混在一起；如果叫 `execute_tool_code` 或更明确的名字，语义更窄：这不是 shell，不是任意代码执行器，而是用代码编排受限工具。
+
+第二，哪些工具能被代码调用？
+
+不要默认取 Agent 的全部工具。应由应用显式配置一个 code-side registry。这个 registry 是能力边界，不是 prompt 建议。
+
+第三，工具结果是否需要进入模型上下文？
+
+中间结果应留在代码运行时；只有最终紧凑结果进入外层工具结果。否则只是换一种方式把大结果打印回上下文。
+
+第四，代码运行时是否可信？
+
+本地 Python 子进程可以作为开发 runner，但不能天然等同于 sandbox。生产需要隔离、超时、内存限制、依赖固定和能力配置。
+
+第五，观测和审批如何保留？
+
+代码内 `call_tool` 不能绕过宿主工具系统。每一次真实工具调用仍应走 schema 校验、审批策略、调用记录、错误处理和资源限制。
+
+---
+
+## 最后的边界
+
+工具编排的目标不是让 Agent 更像一个随手写脚本的自动化工具。它要解决的是 Agent 工具调用里长期存在的一条张力：
+
+> 模型擅长安排和解释，但不适合长期搬运大量中间数据。
+
+直接工具调用把控制面和数据面都放进模型上下文；结果过滤先把大输出压缩后再交给模型；代码化工具编排则更进一步，把多工具之间的循环、分支、转换和聚合放进受控运行时。
+
+这也是为什么“代码”在这里不是形式主义。代码提供的是一种现成的、模型熟悉的、足够表达控制逻辑的数据胶水。但它必须被放在清晰边界里：受限工具、受控运行时、明确 schema、独立 registry、可观测的宿主调用。
+
+做对之后，模型看到的是简单接口：
+
+```python
+result = await call_tool("some_tool", **args)
+```
+
+系统内部发生的，则是一次受控的能力调用：
+
+```text
+generated code
+→ RPC
+→ host tool gateway
+→ native tool
+→ validated result
+→ compact final answer
+```
+
+这才是代码做工具编排真正值得讨论的地方：不是让模型拥有更多裸能力，而是让它用更少的上下文、更清楚的控制逻辑，调用已经被工程系统约束好的能力。
+
+## 参考
+
+- [Executable Code Actions Elicit Better LLM Agents](https://arxiv.org/abs/2402.01030)
+- [Claude API: Programmatic tool calling](https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling)
+- [Microsoft Agent Framework: CodeAct integration ADR](https://github.com/microsoft/agent-framework/blob/main/docs/decisions/0024-codeact-integration.md)

@@ -255,6 +255,130 @@ for product in products:
 
 ---
 
+## 跑一遍完整链路
+
+抽象讨论很容易停在概念上。可以用一个商品报价任务把链路跑一遍。
+
+用户请求大致是：
+
+```text
+给 customer-42 找 ergonomic office chair，每个 SKU 要 3 件。
+只把库存足够的商品放进报价里，同时告诉我哪些候选商品被拒绝。
+```
+
+宿主应用有三个原生工具：
+
+| 工具 | 输入 | 输出 |
+| --- | --- | --- |
+| `search_catalog` | 商品查询词 | 一组候选商品，包含 `sku`、`name`、`unit_price` |
+| `get_inventory` | 单个 `sku` | 这个 SKU 当前可用库存 |
+| `create_quote` | 客户 ID 与报价明细 | 报价 ID、总价和明细 |
+
+如果按直接工具调用做，模型大概率会先看到完整候选商品列表，再逐个发起库存查询，最后自己在上下文里整理哪些可用、哪些不可用。候选商品越多，上下文越重，字段复制和状态维护越容易出错。
+
+代码化编排的心智模型不同。模型外层只需要决定：这个任务适合一次性用代码编排完成。于是它调用一个代码编排工具，并生成类似这样的胶水代码：
+
+```python
+REQUESTED_QTY = 3
+QUERY = "ergonomic office chair"
+CUSTOMER_ID = "customer-42"
+
+catalog = await call_tool("search_catalog", query=QUERY)
+selected = []
+rejected = []
+
+for product in catalog.get("products", []):
+    inventory = await call_tool("get_inventory", sku=product["sku"])
+    item = {
+        "sku": product["sku"],
+        "name": product["name"],
+        "unit_price": product["unit_price"],
+        "available": inventory["available"],
+        "requested_quantity": REQUESTED_QTY,
+    }
+
+    if inventory["available"] >= REQUESTED_QTY:
+        selected.append(item)
+    else:
+        item["reason"] = "insufficient_stock"
+        rejected.append(item)
+
+quote = await call_tool(
+    "create_quote",
+    customer_id=CUSTOMER_ID,
+    items=[
+        {"sku": item["sku"], "quantity": REQUESTED_QTY}
+        for item in selected
+    ],
+)
+
+return {
+    "selected_products": selected,
+    "rejected_products": rejected,
+    "quote": quote,
+}
+```
+
+这段代码里发生了几件事。
+
+第一，模型没有直接调用 `search_catalog`、`get_inventory`、`create_quote`。它只调用了外层的代码编排入口。三个业务工具能否被代码访问，由宿主应用显式注册，不从 Agent 的直接工具列表里自动继承。
+
+第二，`catalog`、`selected`、`rejected` 这些中间状态都留在代码运行时。模型不会看到完整候选列表和每一次库存查询的原始结果，它只会在最后看到 `return` 出来的紧凑结构。
+
+第三，每次 `await call_tool(...)` 并不是 Python 直接调用 Go、.NET 或 Java 里的函数。它会变成一条工具调用请求发回宿主工具网关：
+
+```text
+guest code:
+await call_tool("get_inventory", sku="chair-ergonomic-pro")
+
+wire message:
+{"type":"tool_call","name":"get_inventory","args":{"sku":"chair-ergonomic-pro"}}
+
+host gateway:
+校验工具是否被允许
+校验 args 是否符合 schema
+执行宿主侧 get_inventory
+把结构化结果返回给 guest
+```
+
+第四，类型适配发生在代码里。`search_catalog` 返回的是商品列表；`create_quote` 需要的是报价明细。中间的字段提取、库存过滤、数量组装，都由代码完成，而不是由模型在上下文中手工搬运。
+
+第五，最终模型重新接管的是解释工作。它拿到的不是所有中间数据，而是一个已经聚合好的结果：
+
+```json
+{
+  "selected_products": [
+    {"sku": "chair-ergonomic-pro", "available": 8, "requested_quantity": 3},
+    {"sku": "chair-standing", "available": 5, "requested_quantity": 3}
+  ],
+  "rejected_products": [
+    {"sku": "chair-ergonomic-lite", "available": 1, "reason": "insufficient_stock"}
+  ],
+  "quote": {
+    "quote_id": "quote-1001",
+    "total": 1734
+  }
+}
+```
+
+这条链路跑完后，边界会更清楚：
+
+```text
+用户请求
+→ 模型判断需要多工具编排
+→ 生成胶水代码
+→ guest runtime 执行代码
+→ call_tool 通过 RPC 回到宿主
+→ 宿主网关校验并执行原生工具
+→ 中间结果留在 guest runtime
+→ 紧凑结果返回模型
+→ 模型组织最终回答
+```
+
+这就是“模型安排调用，而不是搬运数据”的具体含义。模型仍然决定策略，工具仍然由宿主执行，代码运行时只是把中间控制流和数据转换接过去。
+
+---
+
 ## 工程上怎么打通宿主工具
 
 如果 Agent 框架和胶水代码使用同一种语言，比如都是 Python 或 JavaScript，把生成代码放进某个解释器里运行，技术上并不难。但这并不等于应该把代码直接嵌入 Agent 进程。

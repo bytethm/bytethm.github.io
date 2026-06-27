@@ -10,21 +10,29 @@ tags:
   - Workflow
   - Dynamic Workflow
   - Multi-Agent
-readingTime: "14 min"
+readingTime: "16 min"
 hero: "/assets/dynamic-workflow-hero.png"
 ---
 
-一个 Agent 可以回答问题，也可以调用工具。再往前一步，它还可以拆出几个角色：一个负责分析，一个负责执行，一个负责 review。
+一个普通 Agent 最容易理解：用户给它一个目标，它读上下文，想下一步，调用工具，拿到结果，再继续想。
 
-这看起来已经像工作流了。直到任务稍微复杂一点，问题就会重新出现：分析结果要不要传给 review？review 不通过应该回到哪一步？三份方案能不能并发比较？某个子任务失败以后是重试、降级，还是先问用户？所有步骤都跑完以后，谁有资格说任务结束？
+这就是很多 Agent 系统的基本形态。它足够简单，也足够强大。问题通常不是它不会做事，而是任务一变长，所有事情都会被塞回同一个地方：模型上下文。
 
-这些问题不是“再加一个 Agent”能解决的。它们合起来是一段控制逻辑：保存中间状态，选择下一步，调度执行单元，消费结果，并判断是否可以关闭任务。
+计划在上下文里，中间结果在上下文里，下一步判断在上下文里，完成判断也在上下文里。模型每一轮都要重新读这堆文本，恢复“现在做到哪了”。
 
-这段控制逻辑，就是[任务级编排](../task-orchestration/)里说的**任务程序**。
+Dynamic Workflow 要解决的就是这个压力。它不是为了让 Agent 多一个炫技的脚本能力，而是让模型把当前任务需要的推进逻辑先写成一段**任务程序**，再交给运行时执行。
 
-Dynamic Workflow 要讨论的不是模型会不会写代码，而是这段任务程序应该放在哪里：如果人提前写死，就是固定 workflow；如果每一轮都由模型在上下文里临时解释，就是 ReAct；如果模型先为当前任务生成一段程序，再交给运行时执行，就是动态工作流。
+简单说：
 
-## 问题从哪里开始
+```text
+普通 ReAct：模型每一轮临时决定下一步
+固定 Workflow：人提前把流程写死
+Dynamic Workflow：模型为当前任务生成流程，运行时执行流程
+```
+
+这篇文章先从读者最熟悉的普通 ReAct 讲起，再看为什么多 Agent 不自动等于 workflow，最后再看 Dynamic Workflow 到底补在哪里。
+
+## 先看普通 ReAct 一次怎么跑
 
 普通 ReAct 循环的优点是简单：
 
@@ -36,106 +44,188 @@ Dynamic Workflow 要讨论的不是模型会不会写代码，而是这段任务
 → 继续
 ```
 
-这适合一次查询、少量工具调用和短路径推理。模型可以根据现场证据即时改变方向，不需要人预先设计完整流程。
+把它放进一个具体任务里，会更容易看清楚。
 
-但复杂任务会让同一段上下文承担太多职责：
-
-- 它要保存用户目标；
-- 它要保存已经做过什么；
-- 它要保存每个工具或子 Agent 的结果；
-- 它要保存下一步计划；
-- 它还要让模型判断任务能不能结束。
-
-上下文变成了计划表、数据库、路由器和验收单。模型每轮都在这堆文本里重新恢复任务状态。短任务还能撑住，长任务就会开始漏步骤、重复动作、丢中间结论，或者在缺少证据时自然收尾。
-
-所以真正的问题不是“Agent 不够聪明”，而是：
-
-> 任务的推进逻辑没有一个独立、可执行、可观察的位置。
-
-## 多 Agent 不是答案
-
-多 Agent 很容易被误解成 workflow。
-
-把任务拆成 analyst、writer、reviewer，确实增加了执行角色。但角色之间怎么连接，仍然需要一段程序：
+假设用户说：
 
 ```text
-draft = writer(input)
+帮我比较三个远程协作方案：
+A. 每天站会
+B. 异步文字更新 + 每周一次决策会
+C. 完全按需开会
+
+请先分析，再让 reviewer 检查风险。
+如果 reviewer 不通过，就根据反馈重写建议。
+```
+
+普通 ReAct 大致会这样推进：
+
+```text
+第 1 轮
+模型读用户目标
+→ 决定先分析方案 A/B/C
+→ 输出或调用工具得到一批分析结果
+→ 分析结果被追加到上下文
+
+第 2 轮
+模型重新读：用户目标 + 第 1 轮分析结果
+→ 决定做 review
+→ reviewer 结论被追加到上下文
+
+第 3 轮
+模型重新读：用户目标 + 分析结果 + review 结论
+→ 判断 review 是否通过
+→ 如果不通过，生成修订版
+→ 修订版继续追加到上下文
+
+第 4 轮
+模型重新读所有内容
+→ 判断是否可以最终回答
+```
+
+这个流程不是错的。它甚至很自然：模型像一个人一样，一边看聊天记录，一边决定下一步。
+
+它的优势也很明显：
+
+- 不需要提前写流程；
+- 中途可以根据结果改方向；
+- 简单任务可以很快完成；
+- 所有内容都在一条对话里，容易解释。
+
+但它也有一个隐含代价：上下文同时承担了太多职责。
+
+## ReAct 的压力：上下文太忙
+
+在上面的例子里，上下文至少要保存五类东西：
+
+| 上下文里的内容 | 它实际承担的职责 |
+| --- | --- |
+| 用户原始目标 | 任务定义 |
+| A/B/C 的分析结果 | 中间数据 |
+| reviewer 的意见 | 验收证据 |
+| “不通过就重写” | 控制逻辑 |
+| 是否已经完成 | 结束判断 |
+
+这些东西全都混在一串 messages 里。模型每一轮都要靠阅读上下文来恢复状态。
+
+短任务问题不大。长任务会出现几个典型压力：
+
+- 中间结果越来越多，模型为了做下一步必须反复读旧内容；
+- “先分析、再 review、不通过就重写”这种控制逻辑只是写在 prompt 里，没有真正变成可执行结构；
+- review 结果是否被使用，靠模型自己记住；
+- 并发分析 A/B/C 只是自然语言要求，不一定真的并发；
+- 模型没有工具调用时，系统很容易把它理解成任务结束。
+
+所以 ReAct 的问题不是“不智能”。它的问题是：任务程序没有显式位置。
+
+这里的**任务程序**不是指某种具体编程语言，而是这段逻辑：
+
+```text
+保存任务状态
+选择下一步
+调度执行单元
+消费中间结果
+判断能否结束
+```
+
+普通 ReAct 当然也有任务程序。只是这段程序分散在模型每一轮推理里，藏在上下文中。
+
+## 多 Agent 也不是 Workflow
+
+看到 ReAct 压力后，一个自然反应是：那就多找几个 Agent。
+
+比如：
+
+```text
+analyst 负责分析
+writer 负责编写建议
+reviewer 负责检查
+```
+
+这确实增加了执行角色。但它还没有回答最关键的问题：
+
+```text
+analyst 的结果给谁？
+writer 什么时候开始？
+reviewer 不通过怎么办？
+review 意见怎样回到 writer？
+重写几次算够？
+谁决定最终可以结束？
+```
+
+这些不是角色问题，而是流程问题。
+
+可以用一段伪代码看得更清楚：
+
+```text
+analysis = analyst(input)
+draft = writer(input, analysis)
 review = reviewer(draft)
 
 if review.pass:
   return draft
 
-draft = writer(input + review.feedback)
+draft = writer(input, analysis, review.feedback)
+return draft
 ```
 
-这里重要的不是有几个 Agent，而是 `if review.pass` 这条边，以及 review 意见怎样回到 writer。没有这段控制逻辑，多个 Agent 只是一组可调用能力。
-
-这也是许多 manager-agent 方案会变重的原因。系统表面上有多个角色，实际上任务程序仍然藏在 manager 的 prompt 和上下文里。它每轮都要重新解释：现在到哪一步了，谁该行动，前面的结果是否可信，什么时候可以结束。
-
-角色可以增加执行能力，但不会自动产生推进规则。多 Agent 解决的是“谁可以做事”；workflow 解决的是“事情怎样被推进”。
-
-## 固定 Workflow 解决了什么
-
-固定 workflow 把任务程序从模型上下文里拿出来，放进代码、Graph 或配置。
-
-这带来几个直接收益：
-
-- 顺序明确；
-- 分支明确；
-- 并发明确；
-- 状态和结果有结构；
-- 运行过程可观察；
-- 结束条件可以被单独定义。
-
-当流程足够稳定时，这几乎总是更好的选择。审批流、标准测试、确定的 ETL、固定的数据处理管道，都不应该每次让模型重新发明。
-
-固定 workflow 的代价也同样明确：它要求设计者提前知道流程。
-
-真实 Agent 任务经常不是这样。用户给出的目标可能很粗；是否需要调查取决于现场证据；某一步失败以后，下一步可能不是重试，而是换路径；有些任务很简单，根本不值得走完整流程。
-
-当异常路径越来越多，固定图会开始膨胀。每增加一种情况，就多一个分支；每允许一种绕行，就多一条边。最后得到的不是更灵活的 workflow，而是一张把适用边界藏起来的大图。
-
-固定 workflow 适合过程稳定的任务。它不适合每次路径都要根据现场证据重新组织的任务。
-
-## ReAct 的另一端
-
-ReAct 站在固定 workflow 的另一端。
-
-它不要求人预先写流程。模型每一轮根据当前上下文决定下一步：
+这里真正让任务跑起来的，不是 analyst、writer、reviewer 三个名字，而是它们之间的边：
 
 ```text
-state -> model chooses action -> execute -> new state
+analysis → draft → review → feedback → revised draft
 ```
 
-这给了系统很强的现场适应能力。模型可以先调查，也可以直接回答；可以发现信息不足后补充检索，也可以在某个方向失败后换路径。
+没有这段控制逻辑，多 Agent 只是一组可调用能力。系统表面上有多个角色，任务程序仍然可能藏在一个 manager prompt 里。
 
-但 ReAct 的灵活性来自“任务程序没有显式化”。计划、状态、路由和结束判断都压在模型上下文里。系统很难单独回答：
+所以要区分两件事：
 
-- 为什么跳过了某个步骤？
-- 为什么 review 结果没有被使用？
-- 为什么这一轮可以结束？
-- 并发是否真的发生了？
-- 中间结果是否被结构化保存？
+```text
+Agent 解决“谁来做事”
+Workflow 解决“事情怎样推进”
+```
 
-所以 ReAct 不是没有任务程序。它是把任务程序拆散在一轮轮模型推理里执行。它灵活，但难以审计、复用和约束。
+## 固定 Workflow 是另一种答案
 
-Dynamic Workflow 的位置，就在固定 workflow 和 ReAct 之间。
+既然任务程序藏在上下文里有问题，那可以把它拿出来，写成固定 workflow。
 
-## Dynamic Workflow 到底动态在哪里
+固定 workflow 会提前定义：
 
-动态工作流可以用一句话描述：
+- 先走哪个阶段；
+- 哪些阶段可以并发；
+- 失败后回到哪里；
+- 中间结果放在哪里；
+- 什么条件下结束。
+
+这对稳定流程非常合适。比如标准审批、固定测试、确定的数据处理管道，都不应该每次让模型重新发明。
+
+但固定 workflow 也有代价：它要求人提前知道流程。
+
+真实 Agent 任务经常不是这样。用户目标可能很粗；是否需要调查取决于现场证据；某一步失败后，下一步可能不是重试，而是换路径；有些任务很简单，根本不值得走完整流程。
+
+当异常路径越来越多，固定图会膨胀。每增加一种情况，就多一个分支；每允许一种绕行，就多一条边。最后得到的不是更灵活的 workflow，而是一张把适用边界藏起来的大图。
+
+所以我们有两个端点：
+
+```text
+ReAct：很灵活，但任务程序隐含在上下文里
+固定 workflow：很清楚，但要求流程预先确定
+```
+
+Dynamic Workflow 站在这两个端点之间。
+
+## Dynamic Workflow 的基本想法
+
+Dynamic Workflow 可以用一句话描述：
 
 > 模型为当前任务生成一段任务程序，运行时负责执行这段程序。
 
-这和固定 workflow 的区别是：程序不是人预先写死的，而是根据当前任务生成。
+它和固定 workflow 的区别是：程序不是人预先写死的，而是根据当前任务生成。
 
-这和 ReAct 的区别是：程序一旦生成，循环、分支、并发、阶段结果就不再完全藏在模型上下文里，而是进入一个可执行运行时。
+它和 ReAct 的区别是：程序一旦生成，循环、分支、并发和阶段结果就不再完全藏在模型上下文里，而是进入一个可执行运行时。
 
 公开产品里已经能看到类似形态。Claude Code 的 Dynamic Workflows 把 workflow 定义为一段由模型生成、runtime 执行的 JavaScript script；官方文档特别强调，loop、branch 和 intermediate results 会留在 script variables 里，而不是全部回到模型上下文。[官方文档](https://code.claude.com/docs/en/workflows)
 
 这些产品细节不是本文的重点。真正值得借鉴的是它验证了一条机制方向：动态工作流不是“多开几个 Agent”，而是把计划从上下文移到可执行程序。
-
-这也解释了为什么它不等同于 subagent、skill 或 agent team。subagent 和 skill 的计划通常仍在主模型上下文里；agent team 可以让多个长期会话协作，但下一步往往仍由 lead agent 逐轮决定。workflow 的差别在于，下一步由脚本推进，中间结果由脚本变量承接，最终才把聚合结果交回主会话。
 
 ![Dynamic Workflow 把计划、分支、并发和中间状态从 prompt context 移到 workflow runtime；子 Agent 仍在宿主 Agent Runtime 中执行，事件继续进入统一 event stream。](/assets/dynamic-workflow-hero.png)
 
@@ -149,41 +239,48 @@ Dynamic Workflow 的位置，就在固定 workflow 和 ReAct 之间。
 | ReAct | 模型每轮即时解释 | 模型上下文 | 灵活、轻量 | 状态和控制隐式 |
 | Dynamic Workflow | 模型为当前任务生成 | workflow runtime | 灵活且可执行 | 需要清楚的运行边界 |
 
-一旦落到一次具体运行，它大致长这样：
+## 一次 Workflow Run 长什么样
+
+继续用前面的远程协作方案例子。一次动态工作流大致是这样：
 
 ```text
-用户提出一个复杂任务
+用户提出复杂任务
 → root Agent 判断普通回答不够，调用 run_workflow
 → 模型生成一段 workflow code
 → workflow runtime 启动一次 workflow run
-  ├─ phase 1：并发创建几个 child agents 分析不同方案
-  ├─ phase 2：创建 reviewer agent 交叉检查结果
-  ├─ phase 3：必要时按 feedback 重试或收敛
+  ├─ phase 1：并发创建 child agents，分别分析 A/B/C
+  ├─ phase 2：创建 reviewer agent，交叉检查三份分析
+  ├─ phase 3：如果 reviewer 不通过，带着 feedback 重写
   └─ phase 4：聚合成一个紧凑结果
 → root Agent 读取 workflow result，组织最终回答
 ```
 
 这不是另开一个和 Agent 系统无关的脚本。workflow run 更像一次临时生成的任务程序实例：它有自己的局部变量和阶段结果，但每次真实的 Agent 调用、工具调用和事件记录，仍然回到宿主 Agent Runtime。
 
-也可以把一次 workflow 拆成三个视角：
+同一件事可以从三个视角看：
 
-| 视角 | 看到的对象 | 主要问题 |
+| 视角 | 看到的对象 | 主要关心 |
 | --- | --- | --- |
 | 用户 | 一个复杂任务正在被推进 | 过程是否可信，结果是否有证据 |
 | root Agent | 一次 `run_workflow` 工具调用和最终结果 | 是否需要生成任务程序，如何解释结果 |
 | workflow runtime | code、局部变量、child agents、阶段结果 | 下一步怎么走，中间结果如何传递 |
 
-“动态”不只是可以临时选几个 Agent。更重要的是，它允许模型把当前任务里的临时控制逻辑写出来：
+这张表很重要。它说明 Dynamic Workflow 不是把 root Agent 替换掉，而是给 root Agent 一个更适合复杂任务的执行单元。
+
+## 这段程序长什么样
+
+前面的描述还是抽象。下面是一段简化后的 workflow code：
 
 ```python
-draft = await agent(
-    {"topic": topic},
-    instruction="Write a concise proposal."
-)
+analyses = await parallel([
+    lambda: agent({"plan": "daily standup"}, instruction="Analyze this plan."),
+    lambda: agent({"plan": "async updates"}, instruction="Analyze this plan."),
+    lambda: agent({"plan": "meet on demand"}, instruction="Analyze this plan.")
+])
 
 review = await agent(
-    {"proposal": draft["text"]},
-    instruction="Review the proposal and return pass/fail with feedback.",
+    {"analyses": analyses},
+    instruction="Review the analyses. Return pass/fail and feedback.",
     schema={
         "type": "object",
         "additionalProperties": False,
@@ -196,21 +293,33 @@ review = await agent(
 )
 
 if not review["pass"]:
-    draft = await agent(
-        {"topic": topic, "feedback": review["feedback"]},
-        instruction="Revise the proposal using the feedback."
+    revised = await agent(
+        {"analyses": analyses, "feedback": review["feedback"]},
+        instruction="Revise the recommendation using the feedback."
+    )
+else:
+    revised = await agent(
+        {"analyses": analyses},
+        instruction="Write the final recommendation."
     )
 
-return {"proposal": draft["text"], "review": review}
+return {"recommendation": revised["text"], "review": review}
 ```
 
-这段代码表达的是任务结构：先写，后审；审不过，带着反馈重写；最后返回结构化结果。
+这段代码没有什么神秘的地方。它只是把原本写在 prompt 里的要求变成了可执行结构：
 
-如果这段逻辑继续藏在自然语言上下文里，模型每一轮都要自己记住它。如果它变成运行时执行的程序，系统至少知道现在在哪一步，哪些结果已经产生，哪些分支被走过。
+```text
+并发分析 A/B/C
+→ review
+→ 不通过就重写
+→ 返回结构化结果
+```
+
+差别在于，prompt 里的控制结构要靠模型每轮记住；代码里的控制结构由运行时执行。模型仍然负责为当前任务生成流程，但确定下来的顺序、分支和中间变量不必每轮重新塞回自然语言上下文。
 
 ## 代码不是普通脚本
 
-看到这里，容易出现一个误解：既然模型能写代码，那是不是直接让它写一段脚本调用业务接口就够了？
+看到这里，很容易问：既然模型能写代码，那是不是直接让它写一段脚本调用业务接口就够了？
 
 这不是 Dynamic Workflow 最值得保留的形态。
 
@@ -231,16 +340,16 @@ workflow code
 
 这条边界很关键。Dynamic Workflow 不是给模型一台裸脚本机，而是给模型一个可以写任务程序的受控入口。
 
-## 子 Agent 不是普通函数
+## `agent(...)` 不是普通函数
 
 动态工作流里的 `agent(...)` 看起来像函数调用，但它不应该被理解成普通函数。
 
 普通函数的身份和行为在代码里已经固定。动态子 Agent 则更像“为当前步骤创建一个临时角色”：
 
 ```python
-analysis = await agent(
-    {"document": doc},
-    instruction="Extract the main risks and return a short list."
+risk_review = await agent(
+    {"recommendation": recommendation},
+    instruction="Act as a skeptical reviewer. Find missing risks."
 )
 ```
 
@@ -248,11 +357,11 @@ analysis = await agent(
 
 这比把一组固定 AgentTool 暴露成函数更灵活。AgentTool 适合稳定角色；动态子 Agent 适合临时角色。前者像“系统里已有一个 reviewer”；后者像“这一步需要一个 reviewer，现在按这个标准临时创建”。
 
-这也是动态工作流和普通工具编排的区别之一。[工具编排](../tool-code-orchestration/)更关注工具之间的数据搬运和类型适配；动态工作流更关注任务里的临时角色、阶段、并发和回路。
+这也是动态工作流和普通[工具编排](../tool-code-orchestration/)的区别之一：工具编排更关注工具之间的数据搬运和类型适配；动态工作流更关注任务里的临时角色、阶段、并发和回路。
 
-## 并发、串行和循环是任务程序的基本语法
+## 并发、串行和循环只是基本语法
 
-API 名字不重要，重要的是它们表达的控制结构。
+Dynamic Workflow 里常见的 `parallel`、`pipeline`、loop，不应该先被理解成 API，而应该被理解成任务程序的基本语法。
 
 并发适合互不依赖的子问题：
 
@@ -293,13 +402,13 @@ for _ in range(2):
     )
 ```
 
-这些结构原本也可以写在 prompt 里：
+这些结构原本也可以写成一句 prompt：
 
 ```text
 请先做 A、B、C，再比较，如果不通过就重写。
 ```
 
-区别在于，prompt 里的控制结构要靠模型每轮记住；代码里的控制结构由运行时执行。模型仍然决定怎样构造这个流程，但一旦流程生成，确定的部分就不必反复回到自然语言推理里。
+但 prompt 只是要求；workflow code 是可执行控制结构。
 
 ## 质量模式比规模更重要
 

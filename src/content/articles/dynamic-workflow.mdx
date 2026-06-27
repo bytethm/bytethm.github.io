@@ -224,6 +224,33 @@ root Agent 读上下文
 
 既然任务程序藏在上下文里有问题，那可以把它拿出来，写成固定 workflow。
 
+这里要先澄清一个容易混的词：很多人说 workflow，默认想到的是一串比较固定的 LLM 节点，例如：
+
+```text
+extract → classify → summarize → answer
+```
+
+这种 workflow 常被拿来和 ReAct Agent 对位：一个是预先写好的 LLM 流程，一个是模型每轮自己决定下一步。
+
+本文说的 workflow 更宽一点。它不只可以编排简单 LLM 节点，也可以把一个完整的 ReAct Agent 当成节点放进去：
+
+```text
+Graph / Workflow
+├─ LLM node
+├─ tool node
+└─ Agent node
+   └─ 内部仍然可以自己 ReAct、调用工具、维护上下文
+```
+
+也就是说，有两层 workflow：
+
+| workflow 用法 | 节点通常是什么 | 主要对位 |
+| --- | --- | --- |
+| LLM 节点流程 | prompt / LLM call / tool call | 替代一个普通 ReAct Agent 的部分推理过程 |
+| Agent 编排流程 | ReAct Agent / AgentTool / Graph node | 编排多个能独立行动的 Agent |
+
+这两种并不冲突。一个框架里的 Graph 既可以只放简单 LLM node，也可以放完整 Agent node。本文后面讨论 Dynamic Workflow 时，重点是第二种：把多个 Agent 或临时角色串成一个任务级流程。
+
 固定 workflow 会提前定义：
 
 - 先走哪个阶段；

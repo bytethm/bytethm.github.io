@@ -195,6 +195,10 @@ Workflow 解决“事情怎样推进”
 
 多个 Agent 出现后，编排它们大致有三种方式：
 
+![三种多 Agent 编排方式：固定 Workflow、root Agent 每轮工具调用、Dynamic Workflow。](/assets/dynamic-workflow-orchestration-modes.png)
+
+*图 1. 多 Agent 不是一种编排方式。真正的差别是控制流归谁所有：业务代码、root Agent 的上下文推理，还是模型生成后交给 runtime 执行的 workflow code。*
+
 | 子 Agent 怎么被串起来 | 谁决定连接关系 | 连接关系在哪里执行 | 对应形态 |
 | --- | --- | --- | --- |
 | 代码或 Graph 预先串好 | 人 / 业务代码 | 固定 workflow runtime | 固定 Workflow |
@@ -263,7 +267,7 @@ Dynamic Workflow 站在这两个端点之间：它不要求人提前写死流程
 
 ![Dynamic Workflow 把计划、分支、并发和中间状态从 prompt context 移到 workflow runtime；子 Agent 仍在宿主 Agent Runtime 中执行，事件继续进入统一 event stream。](/assets/dynamic-workflow-hero.png)
 
-*图 1. Dynamic Workflow 的核心不是多开几个 Agent，而是把任务程序从模型上下文移到可执行运行时；workflow code 负责协调，Agent Runtime 仍负责子 Agent、session 和事件流。*
+*图 2. Dynamic Workflow 的核心不是多开几个 Agent，而是把任务程序从模型上下文移到可执行运行时；workflow code 负责协调，Agent Runtime 仍负责子 Agent、session 和事件流。*
 
 可以把三种形态放在一起：
 

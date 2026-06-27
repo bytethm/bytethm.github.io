@@ -417,6 +417,45 @@ workflow code
 
 这条边界很关键。Dynamic Workflow 不是给模型一台裸脚本机，而是给模型一个可以写任务程序的受控入口。
 
+## 也不是临时写框架集成代码
+
+还有一种看似自然的做法：既然模型能写代码，为什么不直接让它写某个 Graph / Workflow 框架的代码？比如现场创建 graph、定义 state schema、注册节点、绑定 runner、接 session，然后运行。
+
+这当然可以作为高级 escape hatch，但不适合作为 Dynamic Workflow 的默认形态。
+
+因为这会让模型同时解决两类问题：
+
+```text
+任务怎么推进
+框架怎么集成
+```
+
+前者是模型擅长的：这次任务要不要并发、谁来 review、失败后是否重试、最后怎样汇总。
+
+后者是工程系统应该封装掉的：SDK 版本、依赖是否安装、runner 怎么创建、session 怎么接、callback 和事件流怎样回传、工具权限怎样继承、错误怎样恢复。
+
+如果模型临时写的是完整框架代码，它很容易从“生成任务程序”滑到“生成运行时集成”。这会带来几个问题：
+
+- 生成代码依赖具体 SDK 版本和包安装状态；
+- session、memory、event stream、permission policy 这些边界容易被绕开或接错；
+- 外层框架可能只能看到一次脚本开始和结束，而看不到内部子 Agent 的细粒度事件；
+- 模型要学习的不是一个窄小 DSL，而是一整套框架 API。
+
+更稳的做法是把边界收窄：
+
+```python
+analyses = await parallel([...])
+review = await agent({"analyses": analyses}, instruction="Review.")
+if not review["pass"]:
+    result = await agent({"feedback": review["feedback"]}, instruction="Revise.")
+```
+
+模型只写任务级控制逻辑。`agent()`、`parallel()`、`pipeline()` 背后怎样映射到真实 Agent Runtime，由框架负责。
+
+一句话说：
+
+> 可以让模型写框架代码，但默认不应该让模型承担框架集成责任。Dynamic Workflow 的默认边界应该是：模型生成任务程序，宿主框架负责 runner、session、权限、工具和事件流。
+
 ## `agent(...)` 不是普通函数
 
 动态工作流里的 `agent(...)` 看起来像函数调用，但它不应该被理解成普通函数。

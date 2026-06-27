@@ -130,7 +130,7 @@ C. 完全按需开会
 
 普通 ReAct 当然也有任务程序。只是这段程序分散在模型每一轮推理里，藏在上下文中。
 
-## 多 Agent 也不是 Workflow
+## 多 Agent 之后，谁来编排
 
 看到 ReAct 压力后，一个自然反应是：那就多找几个 Agent。
 
@@ -142,7 +142,11 @@ writer 负责编写建议
 reviewer 负责检查
 ```
 
-这确实增加了执行角色。但它还没有回答最关键的问题：
+这一步很合理。长任务往往确实需要不同角色：有人负责分析，有人负责生成，有人负责审查。
+
+但多 Agent 只是把“谁来做事”拆开了，还没有回答“这些 Agent 怎么被串起来”。
+
+真正的问题会马上出现：
 
 ```text
 analyst 的结果给谁？
@@ -153,7 +157,7 @@ review 意见怎样回到 writer？
 谁决定最终可以结束？
 ```
 
-这些不是角色问题，而是流程问题。
+这些不是角色问题，而是编排问题。
 
 可以用一段伪代码看得更清楚：
 
@@ -184,7 +188,30 @@ Agent 解决“谁来做事”
 Workflow 解决“事情怎样推进”
 ```
 
-## 固定 Workflow 是另一种答案
+多个 Agent 出现后，编排它们大致有三种方式：
+
+| 子 Agent 怎么被串起来 | 谁决定连接关系 | 连接关系在哪里执行 | 对应形态 |
+| --- | --- | --- | --- |
+| 代码或 Graph 预先串好 | 人 / 业务代码 | 固定 workflow runtime | 固定 Workflow |
+| root Agent 每轮工具调用 | LLM 每轮基于上下文决定 | root Agent 的 ReAct loop | LLM-driven orchestration |
+| 模型先生成 workflow code | LLM 为当前任务生成任务程序 | workflow runtime 执行代码 | Dynamic Workflow |
+
+第二种最接近普通 ReAct 的延伸。root Agent 可以把 analyst、writer、reviewer 都当成工具调用：
+
+```text
+root Agent 读上下文
+→ 决定调用 analyst
+→ analyst 结果回到 root 上下文
+→ root Agent 再决定调用 writer
+→ writer 结果回到 root 上下文
+→ root Agent 再决定调用 reviewer
+→ reviewer 结果回到 root 上下文
+→ root Agent 判断是否要重写
+```
+
+这种方式很灵活，也很自然。但它的任务程序仍然主要存在于 root Agent 的上下文推理里。子 Agent 变多了，编排本身还没有显式化。
+
+## 固定 Workflow 是第一种答案
 
 既然任务程序藏在上下文里有问题，那可以把它拿出来，写成固定 workflow。
 
@@ -211,7 +238,7 @@ ReAct：很灵活，但任务程序隐含在上下文里
 固定 workflow：很清楚，但要求流程预先确定
 ```
 
-Dynamic Workflow 站在这两个端点之间。
+Dynamic Workflow 站在这两个端点之间：它不要求人提前写死流程，也不让 root Agent 每一轮都从上下文里重新推断流程。
 
 ## Dynamic Workflow 的基本想法
 

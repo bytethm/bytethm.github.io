@@ -149,6 +149,30 @@ Dynamic Workflow 的位置，就在固定 workflow 和 ReAct 之间。
 | ReAct | 模型每轮即时解释 | 模型上下文 | 灵活、轻量 | 状态和控制隐式 |
 | Dynamic Workflow | 模型为当前任务生成 | workflow runtime | 灵活且可执行 | 需要清楚的运行边界 |
 
+一旦落到一次具体运行，它大致长这样：
+
+```text
+用户提出一个复杂任务
+→ root Agent 判断普通回答不够，调用 run_workflow
+→ 模型生成一段 workflow code
+→ workflow runtime 启动一次 workflow run
+  ├─ phase 1：并发创建几个 child agents 分析不同方案
+  ├─ phase 2：创建 reviewer agent 交叉检查结果
+  ├─ phase 3：必要时按 feedback 重试或收敛
+  └─ phase 4：聚合成一个紧凑结果
+→ root Agent 读取 workflow result，组织最终回答
+```
+
+这不是另开一个和 Agent 系统无关的脚本。workflow run 更像一次临时生成的任务程序实例：它有自己的局部变量和阶段结果，但每次真实的 Agent 调用、工具调用和事件记录，仍然回到宿主 Agent Runtime。
+
+也可以把一次 workflow 拆成三个视角：
+
+| 视角 | 看到的对象 | 主要问题 |
+| --- | --- | --- |
+| 用户 | 一个复杂任务正在被推进 | 过程是否可信，结果是否有证据 |
+| root Agent | 一次 `run_workflow` 工具调用和最终结果 | 是否需要生成任务程序，如何解释结果 |
+| workflow runtime | code、局部变量、child agents、阶段结果 | 下一步怎么走，中间结果如何传递 |
+
 “动态”不只是可以临时选几个 Agent。更重要的是，它允许模型把当前任务里的临时控制逻辑写出来：
 
 ```python

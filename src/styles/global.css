@@ -1,3 +1,5 @@
+@import "katex/dist/katex.min.css";
+
 :root {
   color-scheme: light;
   --bg: #fbfbf8;
@@ -341,6 +343,51 @@ img {
   background: var(--surface);
 }
 
+.prose figure {
+  margin: 30px 0;
+}
+
+.prose figure img {
+  margin: 0 auto;
+}
+
+.prose figcaption {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.prose .mechanism-figure {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background:
+    linear-gradient(180deg, rgba(15, 118, 110, 0.04), transparent),
+    var(--surface);
+}
+
+.prose .mechanism-figure img {
+  max-width: none;
+  width: 100%;
+  min-width: 720px;
+  border: 0;
+  background: transparent;
+}
+
+.katex-display {
+  margin: 22px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+}
+
+.prose .katex {
+  font-size: 1.05em;
+}
+
 .prose p:has(> em:only-child) {
   margin-top: 0;
   color: var(--muted);
@@ -441,6 +488,18 @@ img {
   .project-entry {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .prose .mechanism-figure {
+    margin-right: -14px;
+    margin-left: -14px;
+    border-right: 0;
+    border-left: 0;
+    border-radius: 0;
+  }
+
+  .prose .katex {
+    font-size: 0.96em;
   }
 
 }

@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="620" viewBox="0 0 1120 620" role="img" aria-labelledby="title desc">
+  <title id="title">Grammar projection to tokenizer tokens</title>
+  <desc id="desc">A diagram showing grammar state, character prefixes, tokenizer tokens, and which tokens remain reachable.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#0f766e"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfbf8; }
+      .card { fill: #ffffff; stroke: #d9ded7; stroke-width: 2; rx: 14; }
+      .accent { fill: #eef8f6; stroke: #0f766e; stroke-width: 2; rx: 14; }
+      .warn { fill: #fff7e6; stroke: #d89a1f; stroke-width: 2; rx: 14; }
+      .bad { fill: #fff2ed; stroke: #d36b4a; stroke-width: 2; rx: 14; }
+      .title { fill: #171817; font: 700 22px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .label { fill: #242725; font: 650 17px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { fill: #5c625f; font: 500 14px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .mono { fill: #242725; font: 600 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .oktext { fill: #0f766e; font: 700 14px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .badtext { fill: #b42318; font: 700 14px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .line { stroke: #0f766e; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .thin { stroke: #94a39d; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect class="bg" width="1120" height="620"/>
+  <text class="title" x="44" y="48">从语法状态到 token mask：不是按字符采样，而是按 tokenizer token 采样</text>
+
+  <rect class="card" x="44" y="92" width="300" height="184"/>
+  <text class="label" x="72" y="130">Schema 约束</text>
+  <text class="mono" x="72" y="166">priority ∈ {"low",</text>
+  <text class="mono" x="72" y="194">             "medium",</text>
+  <text class="mono" x="72" y="222">             "high"}</text>
+  <text class="small" x="72" y="252">当前位置：已经生成 {"priority":</text>
+
+  <rect class="warn" x="410" y="92" width="300" height="184"/>
+  <text class="label" x="438" y="130">Grammar / parser state</text>
+  <text class="small" x="438" y="166">当前需要一个 enum 字符串</text>
+  <text class="mono" x="438" y="202">FIRST = {"low", "medium", "high"}</text>
+  <text class="small" x="438" y="238">合法性看“前缀是否仍可达终态”</text>
+
+  <rect class="accent" x="776" y="92" width="300" height="184"/>
+  <text class="label" x="804" y="130">Tokenizer vocab</text>
+  <text class="small" x="804" y="166">候选是 token id，不是单个字符</text>
+  <text class="mono" x="804" y="202">"h", "hi", "high",</text>
+  <text class="mono" x="804" y="230">"hello", "medium", ...</text>
+
+  <path class="line" d="M344 184 H402"/>
+  <path class="line" d="M710 184 H768"/>
+
+  <rect class="card" x="86" y="342" width="948" height="210"/>
+  <text class="label" x="118" y="382">token-level projection 示例</text>
+  <text class="small" x="118" y="410">如果当前 enum 分支允许继续形成 "high"，不同 tokenizer token 的可达性不同：</text>
+
+  <g transform="translate(118 440)">
+    <rect class="accent" width="156" height="56"/>
+    <text class="mono" x="18" y="34">"h"</text>
+    <text class="oktext" x="80" y="34">允许</text>
+
+    <rect class="accent" x="176" width="156" height="56"/>
+    <text class="mono" x="194" y="34">"hi"</text>
+    <text class="oktext" x="262" y="34">允许</text>
+
+    <rect class="accent" x="352" width="156" height="56"/>
+    <text class="mono" x="370" y="34">"high"</text>
+    <text class="oktext" x="448" y="34">允许</text>
+
+    <rect class="bad" x="528" width="156" height="56"/>
+    <text class="mono" x="546" y="34">"hello"</text>
+    <text class="badtext" x="632" y="34">禁止</text>
+
+    <rect class="accent" x="704" width="196" height="56"/>
+    <text class="mono" x="722" y="34">"medium"</text>
+    <text class="oktext" x="828" y="34">允许</text>
+  </g>
+
+  <path class="thin" d="M188 496 C220 536 280 536 306 496"/>
+  <path class="thin" d="M362 496 C406 538 468 538 494 496"/>
+  <text class="small" x="198" y="566">前缀 token 允许，因为后续还能完成合法 enum</text>
+  <text class="small" x="664" y="566">不可达 token 被 mask，概率归零</text>
+</svg>

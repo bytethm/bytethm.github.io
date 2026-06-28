@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="560" viewBox="0 0 1120 560" role="img" aria-labelledby="title desc">
+  <title id="title">Logits plus grammar mask</title>
+  <desc id="desc">A vector diagram showing logits, a mask with negative infinity for illegal tokens, and masked logits.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#0f766e"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfbf8; }
+      .title { fill: #171817; font: 700 22px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .label { fill: #242725; font: 650 17px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { fill: #5c625f; font: 500 14px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .mono { fill: #242725; font: 600 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .box { fill: #ffffff; stroke: #d9ded7; stroke-width: 2; rx: 12; }
+      .ok { fill: #eef8f6; stroke: #0f766e; stroke-width: 2; rx: 8; }
+      .bad { fill: #f5f7f4; stroke: #cfd6cf; stroke-width: 2; rx: 8; }
+      .blocked { fill: #fff2ed; stroke: #d36b4a; stroke-width: 2; rx: 8; }
+      .line { stroke: #0f766e; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .fade { fill: #8c9691; }
+      .accent { fill: #0f766e; }
+      .warn { fill: #b45309; }
+    </style>
+  </defs>
+  <rect class="bg" width="1120" height="560"/>
+  <text class="title" x="44" y="50">mask 的本质：非法 token 的分数被压成不可采样</text>
+
+  <rect class="box" x="44" y="90" width="288" height="390"/>
+  <text class="label" x="72" y="126">模型输出 logits z</text>
+  <text class="small" x="72" y="152">模型仍然给所有 token 打分</text>
+  <g transform="translate(72 184)">
+    <rect class="bad" width="218" height="42"/><text class="mono" x="16" y="27">{         1.2</text>
+    <rect class="bad" y="54" width="218" height="42"/><text class="mono" x="16" y="81">"urgent"  9.0</text>
+    <rect class="ok" y="108" width="218" height="42"/><text class="mono" x="16" y="135">"high"    5.1</text>
+    <rect class="ok" y="162" width="218" height="42"/><text class="mono" x="16" y="189">"medium"  3.0</text>
+    <rect class="ok" y="216" width="218" height="42"/><text class="mono" x="16" y="243">"low"     2.0</text>
+  </g>
+
+  <text class="title accent" x="372" y="292">+</text>
+
+  <rect class="box" x="418" y="90" width="288" height="390"/>
+  <text class="label" x="446" y="126">grammar mask m</text>
+  <text class="small" x="446" y="152">schema 只允许 low / medium / high</text>
+  <g transform="translate(446 184)">
+    <rect class="blocked" width="218" height="42"/><text class="mono" x="16" y="27">{        -∞</text>
+    <rect class="blocked" y="54" width="218" height="42"/><text class="mono" x="16" y="81">"urgent" -∞</text>
+    <rect class="ok" y="108" width="218" height="42"/><text class="mono" x="16" y="135">"high"    0</text>
+    <rect class="ok" y="162" width="218" height="42"/><text class="mono" x="16" y="189">"medium"  0</text>
+    <rect class="ok" y="216" width="218" height="42"/><text class="mono" x="16" y="243">"low"     0</text>
+  </g>
+
+  <path class="line" d="M720 285 H774"/>
+
+  <rect class="box" x="804" y="90" width="288" height="390"/>
+  <text class="label" x="832" y="126">masked logits z'</text>
+  <text class="small" x="832" y="152">sampler 只看剩下的合法空间</text>
+  <g transform="translate(832 184)">
+    <rect class="blocked" width="218" height="42"/><text class="mono fade" x="16" y="27">{        -∞</text>
+    <rect class="blocked" y="54" width="218" height="42"/><text class="mono fade" x="16" y="81">"urgent" -∞</text>
+    <rect class="ok" y="108" width="218" height="42"/><text class="mono" x="16" y="135">"high"    5.1</text>
+    <rect class="ok" y="162" width="218" height="42"/><text class="mono" x="16" y="189">"medium"  3.0</text>
+    <rect class="ok" y="216" width="218" height="42"/><text class="mono" x="16" y="243">"low"     2.0</text>
+  </g>
+
+  <text class="label" x="352" y="520">公式：z'_i = z_i + m_i，其中非法 token 的 m_i = -∞，softmax 后概率为 0。</text>
+</svg>

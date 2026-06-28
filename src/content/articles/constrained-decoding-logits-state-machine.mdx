@@ -19,7 +19,7 @@ hero: "/assets/constrained-decoding-hero.png"
 >
 > **源码基线：**本文以本地核验的 vLLM `e6fc848d4ff2d00759516b0c7a47ba640d44e4b2` 为准。实验模型为 `Qwen/Qwen2.5-0.5B-Instruct`，CPU backend，structured outputs backend 固定为 `xgrammar`。
 >
-> **阅读目标：**读完之后，你应该能解释三个问题：模型到底输出什么；vLLM 为什么能在模型外面干预输出；JSON Schema、regex 和 grammar 为什么能变成“下一 token 合法集合”。
+> **阅读目标：**读完之后，读者应该能解释三个问题：模型到底输出什么；vLLM 为什么能在模型外面干预输出；JSON Schema、regex 和 grammar 为什么能变成“下一 token 合法集合”。
 
 ---
 
@@ -31,7 +31,7 @@ hero: "/assets/constrained-decoding-hero.png"
 既然模型已经训练好了，vLLM 凭什么还能让它必须输出合法 JSON？
 ```
 
-这个问题问得对。因为如果我们把模型想象成一个直接吐文本的黑盒，外部系统确实很难在不改权重的情况下控制它。
+这个误解很常见。因为如果模型被想象成一个直接吐文本的黑盒，外部系统确实很难在不改权重的情况下控制它。
 
 但真实的自回归语言模型不是这样工作的。模型通常不是一次性输出一段字符串，而是反复做一件事：
 
@@ -48,6 +48,11 @@ hero: "/assets/constrained-decoding-hero.png"
   ↓
 采样器选择下一个 token
 ```
+
+<figure className="mechanism-figure">
+  <img src="/assets/constrained-decoding-loop.svg" alt="约束解码推理循环：prompt 经过 tokenizer 和模型 forward 得到 logits，grammar 状态机生成 bitmask，sampler 只在合法 token 中选择，并把结果追加回上下文。" />
+  <figcaption>图 1. 约束解码没有改模型权重；它控制的是 logits 到 next token 的选择过程。</figcaption>
+</figure>
 
 约束解码就插在这里。它不需要改模型权重，也不需要重新训练模型。它只需要在每一步采样前，把当前不可能通向合法输出的 token 禁掉。
 
@@ -117,19 +122,21 @@ token ids = [90, 1223, 4812, 778, 991]
 
 以 decoder-only LLM 为例，一次 forward 的形状可以简化成：
 
-```text
-input_ids:
-[B, T]
+$$
+\text{input\_ids} \in \mathbb{N}^{B \times T}
+$$
 
-embedding 后:
-X ∈ R^(B × T × D)
+$$
+X \in \mathbb{R}^{B \times T \times D}
+$$
 
-Transformer blocks 后:
-H ∈ R^(B × T × D)
+$$
+H = \mathrm{Transformer}(X), \quad H \in \mathbb{R}^{B \times T \times D}
+$$
 
-lm_head 投影后:
-logits ∈ R^(B × T × V)
-```
+$$
+Z = H W_{\text{vocab}} + b, \quad Z \in \mathbb{R}^{B \times T \times V}
+$$
 
 其中：
 
@@ -137,16 +144,21 @@ logits ∈ R^(B × T × V)
 - `T` 是序列长度；
 - `D` 是 hidden size；
 - `V` 是词表大小，也就是 vocab size。
+- `W_{\text{vocab}}` 是把 hidden state 投影到词表空间的输出矩阵，常被称为 `lm_head`。
 
-对自回归生成来说，我们最关心最后一个位置：
+对自回归生成来说，最关心最后一个位置：
 
-```text
-h_t ∈ R^D
+$$
+h_t \in \mathbb{R}^{D}
+$$
 
-z_t = W_vocab h_t + b
+$$
+z_t = W_{\text{vocab}} h_t + b
+$$
 
-z_t ∈ R^V
-```
+$$
+z_t \in \mathbb{R}^{V}
+$$
 
 这里的 `z_t` 就是 logits。它是一个长度等于词表大小的向量。每个位置对应一个 token 的原始分数。
 
@@ -170,17 +182,24 @@ id   token        logit
 
 logits 是未归一化分数。要变成概率，通常要经过 softmax：
 
-```text
-p_i = exp(z_i) / Σ_j exp(z_j)
-```
+$$
+p_i = \frac{\exp(z_i)}{\sum_j \exp(z_j)}
+$$
 
 如果加 temperature：
 
-```text
-p_i = exp(z_i / τ) / Σ_j exp(z_j / τ)
-```
+$$
+p_i = \frac{\exp(z_i / \tau)}{\sum_j \exp(z_j / \tau)}
+$$
 
 其中 `τ` 是 temperature。`τ` 越小，分布越尖锐；`τ` 越大，低分 token 更容易被采到。
+
+| 符号 | 含义 |
+|---|---|
+| `z_i` | 第 `i` 个 token 的 logit。 |
+| `p_i` | 第 `i` 个 token 经 softmax 后的概率。 |
+| `τ` | temperature，控制概率分布的尖锐程度。 |
+| `V` | vocab size，softmax 的求和范围覆盖整个词表。 |
 
 采样器可以做很多事：
 
@@ -208,7 +227,7 @@ vLLM 的 sampler 文档字符串也明确把这层称为“samples the next toke
 
 ## 2. 训练阶段为什么不需要 vLLM 选 token
 
-另一个容易卡住的点是：
+另一个常见困惑是：
 
 ```text
 如果推理时 token 是 vLLM 选出来的，那训练时怎么办？训练时还没有 vLLM。
@@ -240,21 +259,28 @@ token 化后：
 
 模型仍然输出 logits：
 
-```text
-logits_t ∈ R^V
-```
+$$
+z_t \in \mathbb{R}^{V}
+$$
 
 但训练数据里已经有真实答案 `x_(t+1)`。所以 loss 可以直接写成：
 
-```text
-L_t = -log softmax(logits_t)[x_(t+1)]
-```
+$$
+L_t = -\log p(x_{t+1} \mid x_{\le t})
+$$
 
 整段序列的 loss：
 
-```text
-L = - Σ_t log p(x_(t+1) | x_≤t)
-```
+$$
+L = - \sum_t \log p(x_{t+1} \mid x_{\le t})
+$$
+
+| 符号 | 含义 |
+|---|---|
+| `x_{\le t}` | 到第 `t` 个位置为止的真实 token 前缀。 |
+| `x_{t+1}` | 训练数据给出的真实下一个 token。 |
+| `p(x_{t+1} \mid x_{\le t})` | 模型给真实下一个 token 分配的概率。 |
+| `L_t` | 第 `t` 个位置的 cross entropy loss。 |
 
 训练时不会真的从分布中采样一个 token 再继续。它使用真实序列作为上下文，这常被称为 teacher forcing。
 
@@ -301,18 +327,19 @@ token   logit
 
 softmax 后假设：
 
-```text
-P(苹果) = 0.48
-P(香蕉) = 0.39
-P(吃)   = 0.07
-...
-```
+$$
+\begin{aligned}
+P(\text{苹果}) &= 0.48 \\
+P(\text{香蕉}) &= 0.39 \\
+P(\text{吃}) &= 0.07
+\end{aligned}
+$$
 
 loss 只关心真实 token 的概率：
 
-```text
-L = -log P(苹果)
-```
+$$
+L = -\log P(\text{苹果})
+$$
 
 反向传播会推动模型下次把 `苹果` 的概率再提高。
 
@@ -417,11 +444,19 @@ id   token        mask
 7    ,           -inf
 ```
 
-然后：
+然后把 mask 加到 logits 上：
 
-```text
-masked_logits = logits + mask
-```
+$$
+z'_i = z_i + m_i
+$$
+
+其中：
+
+| 符号 | 含义 |
+|---|---|
+| `z_i` | 原始 logits 中第 `i` 个 token 的分数。 |
+| `m_i` | 第 `i` 个 token 的 mask 值；合法 token 通常是 `0`，非法 token 是 `-\infty`。 |
+| `z'_i` | 应用 mask 后交给 sampler 的 logit。 |
 
 得到：
 
@@ -439,10 +474,14 @@ id   token        masked_logit
 
 softmax 后：
 
-```text
-P("high") = 1
-其他 token = 0
-```
+$$
+P(\text{"high"}) = 1, \quad P(\text{其他 token}) = 0
+$$
+
+<figure className="mechanism-figure">
+  <img src="/assets/logits-mask-vector.svg" alt="logits 向量加上 grammar mask 后得到 masked logits，非法 token 被置为负无穷，softmax 后概率归零。" />
+  <figcaption>图 2. mask 不改变模型参数，只改变采样前的 token 分布。</figcaption>
+</figure>
 
 如果合法 token 有多个，就只在多个合法 token 中保留概率差异：
 
@@ -600,7 +639,7 @@ token "hig"    可能合法，因为后面还能接 h
 
 ## 6. vLLM 里这条链路怎么走
 
-下面以我们本地跑通的路径为准：
+下面以本地跑通的路径为准：
 
 ```text
 vLLM commit: e6fc848d4ff2d00759516b0c7a47ba640d44e4b2
@@ -622,7 +661,7 @@ VLLM_TARGET_DEVICE=cpu HF_ENDPOINT=https://hf-mirror.com .venv/bin/vllm serve Qw
   --port 8000
 ```
 
-我们实测通过：
+本地 smoke test 覆盖了四类约束：
 
 ```text
 choice  -> 'positive'
@@ -683,7 +722,7 @@ outlines
 lm-format-enforcer
 ```
 
-在我们的实验里固定为 `xgrammar`。vLLM V1 当前 manager 注释也说明：同一个 manager 目前只支持单一 backend，不支持每个请求混用不同 backend。[S4]
+本地实验固定为 `xgrammar`。vLLM V1 当前 manager 注释也说明：同一个 manager 目前只支持单一 backend，不支持每个请求混用不同 backend。[S4]
 
 ### 6.3 xgrammar 用 tokenizer 信息构造 compiler
 
@@ -725,7 +764,7 @@ STRUCT_TAG  -> compile_structural_tag
 
 ```text
 fill_bitmask: 现在下一 token 哪些合法？
-accept_tokens: 我真的生成了这些 token，推进状态。
+accept_tokens: 已经生成这些 token，推进状态。
 rollback: speculative decoding 或临时检查后回滚状态。
 ```
 
@@ -1009,61 +1048,201 @@ mask：
 
 ---
 
-## 8. 这和编译原理的关系
+## 8. 约束解码和编译原理的关系
 
-你的直觉是对的：这很像编译原理。
+约束解码和编译原理共享同一类心智模型：都要维护一个“当前读到哪里了”的状态，并回答“下一步能接受什么”。
 
-但要小心三层 token 的区别。
+但这里有一个关键差异：传统编译器的输入已经是一段完整文本，编译器要判断它是否合法；约束解码是在文本尚未生成完成时，提前阻止不合法分支被采样。
 
-| 层 | 例子 | 谁使用 |
-|---|---|---|
-| 字符 | `{`, `"`, `p`, `r` | JSON / regex 原始语法 |
-| 编译器 token | `LBRACE`, `STRING`, `COLON` | 传统 lexer / parser |
-| LLM token | `"priority"`, `": "`, ` high` | tokenizer / 模型词表 |
+### 8.1 传统编译器：lexer 与 parser 分工
 
-传统编译器通常是：
+传统编译器通常可以拆成：
 
 ```text
 字符流
   ↓ lexer
 词法 token
   ↓ parser
-AST
+AST / parse tree
 ```
 
-约束解码更像：
+例如输入：
+
+```json
+{"priority": "high"}
+```
+
+lexer 关心的是把字符流切成语言 token：
 
 ```text
-目标语法 / schema / regex
-  ↓ 编译成可增量匹配的状态机
-当前已生成 LLM tokens
-  ↓ detokenize / matcher state
-计算下一批合法 LLM token ids
+LBRACE
+STRING("priority")
+COLON
+STRING("high")
+RBRACE
+```
+
+parser 关心的是这些 token 是否满足语法：
+
+```text
+object ::= "{" member "}"
+member ::= string ":" value
+value  ::= string | number | object | array | true | false | null
+```
+
+如果 parser 当前已经读到：
+
+```text
+LBRACE STRING("priority") COLON
+```
+
+它知道下一步需要一个 `value`。这个“下一步可能是什么”的集合，就是语法分析里很重要的心智模型。
+
+### 8.2 regex 约束：更像词法自动机
+
+regex 约束可以看作更接近 lexer 的一侧：
+
+```text
+正则表达式
   ↓
-token mask
+NFA / DFA
+  ↓
+当前状态
+  ↓
+下一字符集合
 ```
 
-regex 约束偏词法自动机：
+例如：
 
 ```text
-正则 -> NFA/DFA -> 当前状态 -> 下一字符集合 -> 下一 token 集合
+[a-z0-9.]{1,20}@\w{6,16}\.com\n
 ```
 
-JSON Schema / grammar 偏语法分析：
+当已经生成：
 
 ```text
-语法规则 -> parser state -> 当前可接受 terminal -> 下一 token 集合
+ada.lovelace@
 ```
 
-区别在于：LLM 不是一个字符一个字符生成。它一次选择一个 tokenizer token。这个 token 可能包含多个字符，甚至包含半个词、前导空格、引号和冒号。
+自动机知道当前处在 domain 部分。下一字符可以是字母、数字、下划线等，但不应该是 `{`、`"` 或换行。
 
-所以约束解码要解决的是：
+### 8.3 JSON / grammar 约束：更像增量 parser
+
+JSON Schema 和 grammar 约束更靠近 parser。它们不只是判断某个字符属于不属于一个正则范围，还要知道结构位置：
 
 ```text
-如果现在选择这个 token，
+现在是在 object 里？
+正在等字段名？
+字段名之后是否必须出现冒号？
+当前 value 是否被 enum 限制？
+required 字段是否已经满足？
+```
+
+用 schema：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "priority": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    }
+  },
+  "required": ["priority"]
+}
+```
+
+当生成前缀是：
+
+```json
+{"priority":
+```
+
+parser state 不只是知道“这里要一个 JSON value”，还知道这个 value 必须来自：
+
+```text
+"low" | "medium" | "high"
+```
+
+可以借用 FIRST set 的心智模型来理解：在某个 parser state 下，语法允许的下一批 terminal 是什么。真实实现不一定暴露一个传统教材里的 FIRST set，但它需要回答同类问题。
+
+### 8.4 LLM 多了一步 token-level projection
+
+传统编译器通常选择的是字符或语言 token。LLM 推理时选择的是 tokenizer token id。
+
+| 层 | 例子 | 作用 |
+|---|---|---|
+| 字符 | `{`, `"`, `h`, `i` | JSON / regex / grammar 的原始文本层。 |
+| 编译器 token | `LBRACE`, `STRING`, `COLON` | 传统 lexer / parser 使用的语言 token。 |
+| LLM token | `"h"`, `"hi"`, `"high"`, `"hello"` | 模型词表里的 tokenizer token id。 |
+
+因此约束解码不是简单地问：
+
+```text
+下一个字符 h 合法吗？
+```
+
+而是问：
+
+```text
+如果下一个 tokenizer token 是 "hi"，
 把它拼到当前输出后，
 是否仍可能走到一个合法终态？
 ```
+
+这一步可以叫 token-level projection：把语法层的可接受字符或 terminal，投影成词表里哪些 token id 仍可选择。
+
+<figure className="mechanism-figure">
+  <img src="/assets/grammar-token-projection.svg" alt="JSON Schema 或 grammar 状态先确定 enum 的合法前缀，再投影到 tokenizer token ids：h、hi、high、medium 仍可通向合法终态，hello 不可达并被 mask。" />
+  <figcaption>图 3. 约束状态机最终必须投影到 tokenizer token id，而不是只停留在字符或编译器 token 层。</figcaption>
+</figure>
+
+### 8.5 用 `"low" | "medium" | "high"` 看前缀可达性
+
+假设当前位置只能生成：
+
+```text
+"low" | "medium" | "high"
+```
+
+tokenizer 里可能有这些 token：
+
+```text
+"h"
+"hi"
+"high"
+"hello"
+"medium"
+```
+
+它们的命运不同：
+
+| tokenizer token | 是否允许 | 原因 |
+|---|---:|---|
+| `"h"` | 允许 | 它可以继续补成 `"high"`。 |
+| `"hi"` | 允许 | 它仍然是 `"high"` 的合法前缀。 |
+| `"high"` | 允许 | 它完整匹配 enum 值。 |
+| `"hello"` | 禁止 | 它不可能再变成 `"high"`、`"low"` 或 `"medium"`。 |
+| `"medium"` | 允许 | 它完整匹配 enum 值。 |
+
+这就是 constrained decoding 比“字符白名单”更复杂的地方。它关心的不是单个字符是否出现在合法字符集合里，而是：
+
+```text
+当前前缀 + 候选 tokenizer token
+```
+
+是否仍可到达 grammar 的接受状态。
+
+### 8.6 对照表
+
+| 编译原理概念 | 约束解码里的对应物 | 关键差异 |
+|---|---|---|
+| lexer | regex / tokenizer-aware matcher 的一部分 | LLM token 不是语言 token，可能跨越多个字符。 |
+| parser | JSON Schema / grammar matcher | 它在生成过程中增量运行，不是等完整文本生成后再判断。 |
+| parser state | grammar 当前状态 | 每个请求都有自己的状态，随输出 token 前进。 |
+| FIRST set 心智模型 | 下一步可接受的 token 前缀集合 | 最终要转换成 vocab 维度的 bitmask。 |
+| parse error | token 被 mask 或生成后被拒绝 | 正常情况下非法 token 在采样前就被禁掉。 |
 
 这就是为什么 xgrammar 需要 tokenizer info，也就是为什么 vLLM 的 `XgrammarBackend` 初始化时先处理 tokenizer，再创建 grammar compiler。[S6]
 
@@ -1115,13 +1294,13 @@ grammar 是否接受
 
 约束解码解决的是“结构合法”，不是“任务正确”。
 
-这也是为什么 tiny random 模型不适合研究 structured output 的能力效果。它可以在 mask 帮助下输出合法结构，但字段内容没有可靠语义。我们后来换成 `Qwen/Qwen2.5-0.5B-Instruct`，是因为它足够小，同时有基本指令跟随能力。
+这也是为什么 tiny random 模型不适合研究 structured output 的能力效果。它可以在 mask 帮助下输出合法结构，但字段内容没有可靠语义。本地实验改用 `Qwen/Qwen2.5-0.5B-Instruct`，是因为它足够小，同时有基本指令跟随能力。
 
 ---
 
 ## 10. 为什么复杂 schema 可能出问题
 
-我们本地实验里有一个值得记下的现象：
+本地实验里有一个值得记下的现象：
 
 ```text
 扁平 JSON Schema + enum 可以跑通。
@@ -1136,13 +1315,13 @@ schema 复杂度、backend 支持范围、tokenizer、CPU/GPU 路径、speculati
 
 从源码看，vLLM 不是只有一个 structured output backend。`StructuredOutputManager` 可选择 `xgrammar`、`guidance`、`outlines` 和 `lm-format-enforcer`。[S4]
 
-但我们本地还观察到：
+但本地还观察到：
 
 ```text
 lm-format-enforcer 在当前源码版本与已安装包组合下会导入旧路径失败。
 ```
 
-所以研究源码时，不要把“文档列出的 backend”直接等同于“当前环境都能无缝跑通”。应该像我们这次一样：
+所以研究源码时，不要把“文档列出的 backend”直接等同于“当前环境都能无缝跑通”。更稳妥的做法是：
 
 ```text
 固定模型
@@ -1223,7 +1402,7 @@ vllm/v1/structured_output/__init__.py
 
 ### 11.3 `XgrammarBackend` / `XgrammarGrammar`
 
-这是我们本地跑通的 backend。
+这是本地跑通的 backend。
 
 关键问题：
 

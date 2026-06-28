@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="520" viewBox="0 0 1120 520" role="img" aria-labelledby="title desc">
+  <title id="title">Constrained decoding inference loop</title>
+  <desc id="desc">A deterministic diagram of prompt tokenization, model forward, logits, grammar bitmask, sampler, append token, and loop.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#0f766e"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfbf8; }
+      .card { fill: #ffffff; stroke: #d9ded7; stroke-width: 2; rx: 14; }
+      .accent { fill: #eef8f6; stroke: #0f766e; stroke-width: 2; rx: 14; }
+      .warn { fill: #fff7e6; stroke: #d89a1f; stroke-width: 2; rx: 14; }
+      .title { fill: #171817; font: 700 22px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .label { fill: #242725; font: 650 18px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { fill: #5c625f; font: 500 15px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .mono { fill: #242725; font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .line { stroke: #0f766e; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .loop { stroke: #d89a1f; stroke-width: 3; fill: none; marker-end: url(#arrow); stroke-dasharray: 8 8; }
+    </style>
+  </defs>
+  <rect class="bg" width="1120" height="520"/>
+  <text class="title" x="44" y="48">约束解码插在 “logits → next token” 这一步</text>
+
+  <rect class="card" x="44" y="92" width="160" height="112"/>
+  <text class="label" x="76" y="132">Prompt</text>
+  <text class="small" x="74" y="162">用户文本</text>
+
+  <rect class="card" x="248" y="92" width="160" height="112"/>
+  <text class="label" x="276" y="132">Tokenizer</text>
+  <text class="mono" x="277" y="162">text → ids</text>
+
+  <rect class="accent" x="452" y="92" width="176" height="112"/>
+  <text class="label" x="492" y="132">Model</text>
+  <text class="mono" x="488" y="162">ids → logits</text>
+
+  <rect class="card" x="672" y="92" width="160" height="112"/>
+  <text class="label" x="718" y="132">Logits</text>
+  <text class="mono" x="701" y="162">z ∈ R^V</text>
+
+  <rect class="warn" x="672" y="282" width="160" height="112"/>
+  <text class="label" x="708" y="322">Grammar</text>
+  <text class="small" x="697" y="352">schema / regex</text>
+
+  <rect class="warn" x="876" y="282" width="172" height="112"/>
+  <text class="label" x="921" y="322">Bitmask</text>
+  <text class="mono" x="906" y="352">illegal → -∞</text>
+
+  <rect class="accent" x="876" y="92" width="172" height="112"/>
+  <text class="label" x="921" y="132">Sampler</text>
+  <text class="small" x="902" y="162">只在合法 token 中选</text>
+
+  <path class="line" d="M204 148 H240"/>
+  <path class="line" d="M408 148 H444"/>
+  <path class="line" d="M628 148 H664"/>
+  <path class="line" d="M832 148 H868"/>
+  <path class="line" d="M752 204 V274"/>
+  <path class="line" d="M832 338 H868"/>
+  <path class="line" d="M962 282 V212"/>
+
+  <path class="loop" d="M962 92 C962 48 540 38 540 84"/>
+  <text class="small" x="748" y="58">append next token，进入下一轮</text>
+
+  <rect class="card" x="118" y="244" width="420" height="188"/>
+  <text class="label" x="146" y="284">一次 decode step 的最小伪代码</text>
+  <text class="mono" x="146" y="318">logits = model.forward(ids)</text>
+  <text class="mono" x="146" y="348">mask = grammar.next_mask()</text>
+  <text class="mono" x="146" y="378">next = sample(logits + mask)</text>
+  <text class="mono" x="146" y="408">grammar.accept(next); ids.append(next)</text>
+</svg>

@@ -1,0 +1,1427 @@
+---
+title: "约束解码从 logits 到状态机"
+description: "模型并不是直接吐出 JSON；它先给词表打分，推理运行时再用语法状态机生成 token mask，把非法路径从采样空间里裁掉。"
+published: 2026-06-29
+status: draft
+kind: source-reading
+series: llm-systems
+tags:
+  - LLM Serving
+  - vLLM
+  - Structured Outputs
+  - Constrained Decoding
+  - xgrammar
+readingTime: "48 min"
+hero: "/assets/constrained-decoding-hero.png"
+---
+
+> **版本快照：2026-06-29**
+>
+> **源码基线：**本文以本地核验的 vLLM `e6fc848d4ff2d00759516b0c7a47ba640d44e4b2` 为准。实验模型为 `Qwen/Qwen2.5-0.5B-Instruct`，CPU backend，structured outputs backend 固定为 `xgrammar`。
+>
+> **阅读目标：**读完之后，你应该能解释三个问题：模型到底输出什么；vLLM 为什么能在模型外面干预输出；JSON Schema、regex 和 grammar 为什么能变成“下一 token 合法集合”。
+
+---
+
+## 问题从哪里开始
+
+很多人第一次听到 structured outputs 或 constrained decoding，会自然产生一个误解：
+
+```text
+既然模型已经训练好了，vLLM 凭什么还能让它必须输出合法 JSON？
+```
+
+这个问题问得对。因为如果我们把模型想象成一个直接吐文本的黑盒，外部系统确实很难在不改权重的情况下控制它。
+
+但真实的自回归语言模型不是这样工作的。模型通常不是一次性输出一段字符串，而是反复做一件事：
+
+```text
+给定已经出现的 token 序列，计算下一个 token 的分数。
+```
+
+这给了推理运行时一个很关键的插入点：
+
+```text
+模型给分
+  ↓
+运行时修改或过滤分数
+  ↓
+采样器选择下一个 token
+```
+
+约束解码就插在这里。它不需要改模型权重，也不需要重新训练模型。它只需要在每一步采样前，把当前不可能通向合法输出的 token 禁掉。
+
+一句话版本：
+
+> **模型负责给候选 token 打分；约束解码负责告诉采样器哪些 token 此刻不能选。**
+
+下面把这句话拆开。
+
+---
+
+## 1. token 不是字符，模型也不是直接输出文本
+
+### 1.1 文本先被 tokenizer 切成 token
+
+LLM 处理的基本单位通常不是字符，也不是编译原理里的词法 token，而是 tokenizer 产生的 token id。
+
+同一句话：
+
+```text
+{"priority": "high"}
+```
+
+在不同 tokenizer 下可能切成不同片段：
+
+```text
+[
+  "{",
+  "\"",
+  "priority",
+  "\":",
+  " \"",
+  "high",
+  "\"",
+  "}"
+]
+```
+
+也可能出现更粗或更细的切分：
+
+```text
+[
+  "{\"",
+  "priority",
+  "\": \"",
+  "high",
+  "\"}"
+]
+```
+
+这些片段再映射成整数：
+
+```text
+token ids = [90, 1223, 4812, 778, 991]
+```
+
+模型看到的是这些整数 token id，而不是原始字符串。
+
+这点对约束解码很重要。JSON Schema 是字符级或结构级约束；vLLM 最终必须把它落到 token 级别：
+
+```text
+哪些 token 现在可以选？
+哪些 token 现在必须禁掉？
+```
+
+### 1.2 模型 forward 输出 logits
+
+以 decoder-only LLM 为例，一次 forward 的形状可以简化成：
+
+```text
+input_ids:
+[B, T]
+
+embedding 后:
+X ∈ R^(B × T × D)
+
+Transformer blocks 后:
+H ∈ R^(B × T × D)
+
+lm_head 投影后:
+logits ∈ R^(B × T × V)
+```
+
+其中：
+
+- `B` 是 batch size；
+- `T` 是序列长度；
+- `D` 是 hidden size；
+- `V` 是词表大小，也就是 vocab size。
+
+对自回归生成来说，我们最关心最后一个位置：
+
+```text
+h_t ∈ R^D
+
+z_t = W_vocab h_t + b
+
+z_t ∈ R^V
+```
+
+这里的 `z_t` 就是 logits。它是一个长度等于词表大小的向量。每个位置对应一个 token 的原始分数。
+
+假设词表只有 8 个 token：
+
+```text
+id   token        logit
+0    {            1.2
+1    }           -0.8
+2    "priority"  0.4
+3    :           -1.5
+4    "high"      5.1
+5    hello        3.7
+6    true         2.2
+7    ,            0.1
+```
+
+模型此时还没有“输出 `"high"`”。它只是说：在当前上下文下，每个 token 有这些分数。
+
+### 1.3 logits 不是概率
+
+logits 是未归一化分数。要变成概率，通常要经过 softmax：
+
+```text
+p_i = exp(z_i) / Σ_j exp(z_j)
+```
+
+如果加 temperature：
+
+```text
+p_i = exp(z_i / τ) / Σ_j exp(z_j / τ)
+```
+
+其中 `τ` 是 temperature。`τ` 越小，分布越尖锐；`τ` 越大，低分 token 更容易被采到。
+
+采样器可以做很多事：
+
+```text
+greedy: 取 logit 最大的 token
+temperature sampling: 按 softmax 概率随机采样
+top-k: 只保留前 k 个 token
+top-p: 只保留累计概率达到 p 的 token 集合
+penalty: 重复惩罚、频率惩罚、presence penalty
+logit bias: 手动调高或调低某些 token
+```
+
+vLLM 的 sampler 文档字符串也明确把这层称为“samples the next tokens from the model's outputs”，并列出 apply processors、penalties、temperature、top-k/top-p 和 sample 的顺序。[S2]
+
+所以严格说：
+
+```text
+模型输出 logits。
+推理运行时根据 logits 选 token。
+```
+
+日常说“模型输出 token”没有问题，但理解约束解码时必须把这两层拆开。
+
+---
+
+## 2. 训练阶段为什么不需要 vLLM 选 token
+
+另一个容易卡住的点是：
+
+```text
+如果推理时 token 是 vLLM 选出来的，那训练时怎么办？训练时还没有 vLLM。
+```
+
+答案是：训练阶段通常不需要选 token。
+
+### 2.1 next-token prediction
+
+预训练或 SFT 的核心形式是 next-token prediction。给定一段真实文本：
+
+```text
+我 喜欢 吃 苹果
+```
+
+token 化后：
+
+```text
+[x_1, x_2, x_3, x_4]
+```
+
+训练目标是：
+
+```text
+看到 x_1，预测 x_2
+看到 x_1, x_2，预测 x_3
+看到 x_1, x_2, x_3，预测 x_4
+```
+
+模型仍然输出 logits：
+
+```text
+logits_t ∈ R^V
+```
+
+但训练数据里已经有真实答案 `x_(t+1)`。所以 loss 可以直接写成：
+
+```text
+L_t = -log softmax(logits_t)[x_(t+1)]
+```
+
+整段序列的 loss：
+
+```text
+L = - Σ_t log p(x_(t+1) | x_≤t)
+```
+
+训练时不会真的从分布中采样一个 token 再继续。它使用真实序列作为上下文，这常被称为 teacher forcing。
+
+### 2.2 一个小矩阵例子
+
+假设词表只有 5 个 token：
+
+```text
+0: 我
+1: 喜欢
+2: 吃
+3: 苹果
+4: 香蕉
+```
+
+训练样本：
+
+```text
+我 喜欢 吃 苹果
+```
+
+模型某一步输入：
+
+```text
+我 喜欢 吃
+```
+
+真实下一个 token 是：
+
+```text
+苹果
+```
+
+模型输出 logits：
+
+```text
+token   logit
+我      -1.0
+喜欢    -0.5
+吃       0.1
+苹果     2.0
+香蕉     1.8
+```
+
+softmax 后假设：
+
+```text
+P(苹果) = 0.48
+P(香蕉) = 0.39
+P(吃)   = 0.07
+...
+```
+
+loss 只关心真实 token 的概率：
+
+```text
+L = -log P(苹果)
+```
+
+反向传播会推动模型下次把 `苹果` 的概率再提高。
+
+训练阶段不需要 vLLM。vLLM 这种 serving runtime 主要负责在线推理：
+
+```text
+没有真实答案
+必须从模型分布中选一个 token
+选完再拼回上下文
+继续生成
+```
+
+约束解码发生的正是这个在线推理阶段。
+
+---
+
+## 3. 推理循环：为什么外部运行时能插手
+
+一次推理不是“调用模型一次得到完整回答”，而是一个循环。
+
+```text
+prompt 文本
+  ↓
+tokenizer
+  ↓
+input_ids
+  ↓
+模型 forward
+  ↓
+logits
+  ↓
+sampler 选出 next_token_id
+  ↓
+append 到上下文
+  ↓
+如果没结束，继续 forward
+```
+
+伪代码：
+
+```python
+ids = tokenizer.encode(prompt)
+
+while not stopped:
+    logits = model.forward(ids)
+    next_token = sampler.sample(logits[-1])
+    ids.append(next_token)
+```
+
+真正的 vLLM 要复杂得多：continuous batching、KV Cache、prefix cache、speculative decoding、流式输出、停止条件、调度公平性都会参与。但关键插入点仍然是：
+
+```text
+logits -> sample next token
+```
+
+vLLM 的 V1 engine step 里可以看到这个分界：
+
+```text
+scheduler_output = self.scheduler.schedule()
+future = self.model_executor.execute_model(scheduler_output, non_block=True)
+grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+model_output = future.result()
+if model_output is None:
+    model_output = self.model_executor.sample_tokens(grammar_output)
+```
+
+这说明模型执行和 token 采样是可以分开的。structured output 的 grammar bitmask 也正是在采样阶段传进去。[S1]
+
+所以 vLLM 不是改变了模型的内部注意力或权重，而是在模型算完 logits 后，控制 logits 如何进入采样。
+
+---
+
+## 4. mask 是什么
+
+mask 的本质很简单：对每个 token 标记“允许”或“禁止”。
+
+假设当前模型 logits 是：
+
+```text
+id   token        logit
+0    {            1.2
+1    }           -0.8
+2    "priority"  0.4
+3    :           -1.5
+4    "high"      5.1
+5    hello        3.7
+6    true         2.2
+7    ,            0.1
+```
+
+如果当前 JSON Schema 状态要求只能输出 enum 值 `"high"`，那么约束系统可以构造：
+
+```text
+id   token        mask
+0    {           -inf
+1    }           -inf
+2    "priority" -inf
+3    :           -inf
+4    "high"       0
+5    hello       -inf
+6    true        -inf
+7    ,           -inf
+```
+
+然后：
+
+```text
+masked_logits = logits + mask
+```
+
+得到：
+
+```text
+id   token        masked_logit
+0    {           -inf
+1    }           -inf
+2    "priority" -inf
+3    :           -inf
+4    "high"       5.1
+5    hello       -inf
+6    true        -inf
+7    ,           -inf
+```
+
+softmax 后：
+
+```text
+P("high") = 1
+其他 token = 0
+```
+
+如果合法 token 有多个，就只在多个合法 token 中保留概率差异：
+
+```text
+legal = {"low", "medium", "high"}
+```
+
+模型仍然可以在合法集合里表达偏好：
+
+```text
+"low"     1.2
+"medium" 2.8
+"high"   5.1
+```
+
+约束解码不是“强行指定答案”，而是：
+
+```text
+裁掉非法空间，让模型在合法空间里继续按概率选择。
+```
+
+vLLM 里还有别的 mask 概念。比如 sampler 中的 `allowed_token_ids_mask` 会用 `masked_fill_` 把不允许的 token 填成 `-inf`。[S3] structured outputs 的 grammar bitmask 是另一条路径，它通过 xgrammar 的 `apply_token_bitmask_inplace` 应用到 logits。[S5]
+
+两者心智模型一致：
+
+```text
+不允许的 token -> logit 变成 -inf -> 概率变成 0
+```
+
+---
+
+## 5. 约束从哪里来：JSON Schema、regex、grammar
+
+如果只是手写一个固定白名单，mask 很容易理解。问题在于：
+
+```text
+JSON Schema / regex / grammar 怎么知道下一 token 哪些合法？
+```
+
+答案是状态机或 parser state。
+
+### 5.1 regex 更像词法自动机
+
+正则表达式：
+
+```text
+[a-z0-9.]{1,20}@\w{6,16}\.com\n
+```
+
+可以被编译成自动机。自动机有当前状态，读取字符后转移到下一个状态。
+
+非常简化地看：
+
+```text
+start
+  ↓ 读用户名字符
+user_part
+  ↓ 读 @
+domain_part
+  ↓ 读 .com
+suffix
+  ↓ 读换行
+accept
+```
+
+生成到：
+
+```text
+ada.lovelace@
+```
+
+自动机知道下一步应该进入 domain 部分，所以合法字符可能是字母、数字、下划线等，而不是 `{` 或 `"`。
+
+### 5.2 JSON / grammar 更像增量语法分析
+
+JSON 可以写成类似语法：
+
+```text
+value  ::= object | array | string | number | "true" | "false" | "null"
+object ::= "{" members? "}"
+member ::= string ":" value
+array  ::= "[" elements? "]"
+```
+
+当已经生成：
+
+```json
+{"priority":
+```
+
+parser state 知道当前位置需要一个 `value`。
+
+如果 schema 进一步约束：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "priority": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    }
+  },
+  "required": ["priority"]
+}
+```
+
+那当前位置的合法内容不只是任意 JSON value，而是三个 enum 字符串之一：
+
+```text
+"low"
+"medium"
+"high"
+```
+
+所以约束系统可以问：
+
+```text
+在当前 parser state 下，哪些 token 可以作为下一步？
+```
+
+### 5.3 为什么不能只按字符做
+
+LLM 采样时选的是 tokenizer token，不是字符。
+
+假设 tokenizer 里有这些 token：
+
+```text
+"h"
+"hi"
+"high"
+"high\""
+"hello"
+"hig"
+"hway"
+```
+
+当 schema 允许 `"high"` 时，合法 token 不是简单的“字符 h 合法”。系统必须判断：
+
+```text
+选这个 token 后，当前字符串是否仍可能完成为合法 JSON？
+```
+
+例如：
+
+```text
+token "high"   合法，因为它能完成 enum
+token "hello"  非法，因为它不可能变成 "high"
+token "hig"    可能合法，因为后面还能接 h
+```
+
+实际情况还会更复杂，因为 token 可能包含前导空格、引号、字节 fallback、特殊 token、停止 token。xgrammar 这类库存在的意义，就是把字符级或语法级约束转换为 token 级 bitmask。
+
+---
+
+## 6. vLLM 里这条链路怎么走
+
+下面以我们本地跑通的路径为准：
+
+```text
+vLLM commit: e6fc848d4ff2d00759516b0c7a47ba640d44e4b2
+model: Qwen/Qwen2.5-0.5B-Instruct
+device: CPU
+structured outputs backend: xgrammar
+```
+
+启动时固定 backend：
+
+```bash
+VLLM_TARGET_DEVICE=cpu HF_ENDPOINT=https://hf-mirror.com .venv/bin/vllm serve Qwen/Qwen2.5-0.5B-Instruct \
+  --dtype float32 \
+  --max-model-len 1024 \
+  --enforce-eager \
+  --gpu-memory-utilization 0.2 \
+  --structured-outputs-config '{"backend":"xgrammar"}' \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+我们实测通过：
+
+```text
+choice  -> 'positive'
+regex   -> '1@analyticalengine.com\n'
+grammar -> 'SELECT name FROM users'
+json_schema ->
+{
+  "title": "User Cannot Log In",
+  "priority": "high",
+  "owner": "platform"
+}
+```
+
+这不是模型自己突然“更守规矩”，而是下面这条链路生效了。
+
+### 6.1 请求参数先变成 structured output request
+
+OpenAI-compatible 请求里可以带：
+
+```python
+response_format={
+    "type": "json_schema",
+    "json_schema": {
+        "name": "ticket",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                "owner": {"type": "string"},
+            },
+            "required": ["title", "priority", "owner"],
+        },
+    },
+}
+```
+
+vLLM 会把 sampling params 里的 structured outputs 转成一个 request-local 对象。`get_structured_output_key()` 会判断这是 JSON、JSON object、regex、choice、grammar 还是 structural tag。[S7]
+
+心智上就是：
+
+```text
+API object
+  ↓
+StructuredOutputsParams
+  ↓
+(request_type, grammar_spec)
+```
+
+### 6.2 第一次需要时初始化 backend
+
+`StructuredOutputManager.grammar_init()` 在请求使用 structured output 时触发。它会根据 `_backend` 选择具体 backend：
+
+```text
+xgrammar
+guidance
+outlines
+lm-format-enforcer
+```
+
+在我们的实验里固定为 `xgrammar`。vLLM V1 当前 manager 注释也说明：同一个 manager 目前只支持单一 backend，不支持每个请求混用不同 backend。[S4]
+
+### 6.3 xgrammar 用 tokenizer 信息构造 compiler
+
+`XgrammarBackend.__post_init__()` 会基于 tokenizer 构造 `TokenizerInfo`，再创建 `GrammarCompiler`。[S6]
+
+这一步非常关键。因为约束不是只在字符上运行，它必须知道模型 tokenizer 的词表长什么样：
+
+```text
+tokenizer vocab
+  ↓
+xgrammar TokenizerInfo
+  ↓
+GrammarCompiler
+```
+
+如果不了解 tokenizer，约束系统无法回答“这个 token 是否仍可能通向合法 JSON”。
+
+### 6.4 JSON Schema / regex / grammar 被编译成 matcher
+
+`XgrammarBackend.compile_grammar()` 会按请求类型分发：
+
+```text
+JSON        -> compile_json_schema
+JSON_OBJECT -> compile_json_schema({"type": "object"})
+GRAMMAR     -> compile_grammar
+REGEX       -> compile_regex
+STRUCT_TAG  -> compile_structural_tag
+```
+
+然后返回 `XgrammarGrammar`，里面包着 `xgr.GrammarMatcher`。[S6]
+
+可以把 `GrammarMatcher` 理解成：
+
+```text
+一个知道当前生成前缀的增量语法状态机。
+```
+
+它至少要支持三类动作：
+
+```text
+fill_bitmask: 现在下一 token 哪些合法？
+accept_tokens: 我真的生成了这些 token，推进状态。
+rollback: speculative decoding 或临时检查后回滚状态。
+```
+
+vLLM 的 `XgrammarGrammar` 里确实有这些方法。[S8]
+
+### 6.5 每一步生成前，manager 填 bitmask
+
+每次 scheduler 发现某些请求使用 structured output，就会调用：
+
+```text
+scheduler.get_grammar_bitmask(...)
+  ↓
+structured_output_manager.grammar_bitmask(...)
+```
+
+scheduler 只收集这一步被调度且需要 structured output 的 request id，然后让 manager 生成 bitmask。[S9]
+
+manager 里的关键动作是：
+
+```python
+grammar.fill_bitmask(self._grammar_bitmask, index)
+```
+
+如果是 speculative decoding，还会临时 `accept_tokens` 推进，再 `rollback` 回去，以便为多个可能位置准备 mask。[S4]
+
+非 speculative 情况可以简化理解为：
+
+```text
+对 batch 中每个 structured request:
+  根据该 request 的 grammar 当前状态
+  填一行 token bitmask
+```
+
+### 6.6 采样前应用 bitmask 到 logits
+
+生成出来的 bitmask 不是最终输出。它还要被传到 worker/sampler 侧，和 logits 对齐。
+
+`apply_grammar_bitmask()` 会做两件事：
+
+1. 将 scheduler 侧紧凑的 bitmask 重新排序，使它和实际 logits batch 对齐；
+2. 调用 xgrammar 的 kernel 把 bitmask 应用到 logits。
+
+关键调用是：
+
+```python
+xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=...)
+```
+
+CPU 路径下如果 logits 不是 float32，还会先转 float32，应用 mask，再拷回原 dtype。[S5]
+
+这一刻才是真正“禁用非法 token”的地方：
+
+```text
+非法 token 的 logit 被改到不可采样状态。
+```
+
+### 6.7 token 采样后，grammar 状态也要前进
+
+只 mask 还不够。因为下一步约束依赖“刚才到底生成了什么”。
+
+所以 scheduler 在处理输出 token 时，会调用：
+
+```python
+grammar.accept_tokens(req_id, new_token_ids)
+```
+
+如果 grammar 拒绝了已经生成的 token，vLLM 会把请求标为错误。这一般不该发生，因为采样前已经 mask 过。[S10]
+
+完整循环就是：
+
+```text
+当前 grammar state
+  ↓
+fill_next_token_bitmask
+  ↓
+mask logits
+  ↓
+sample token
+  ↓
+accept token, advance grammar state
+  ↓
+下一步
+```
+
+---
+
+## 7. 用一个完整小例子走一遍
+
+约束：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "priority": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    }
+  },
+  "required": ["priority"]
+}
+```
+
+为了方便说明，假设词表只有这些 token：
+
+```text
+id  token
+0   {
+1   }
+2   "priority"
+3   :
+4   "low"
+5   "medium"
+6   "high"
+7   "urgent"
+8   hello
+9   ,
+10  <eos>
+```
+
+### 第 0 步：还没生成
+
+grammar state：
+
+```text
+期待 object 开始
+```
+
+模型 logits：
+
+```text
+{           1.0
+hello       7.0
+"urgent"   4.0
+<eos>       2.0
+...
+```
+
+如果不约束，模型很可能选 `hello`。
+
+mask：
+
+```text
+{        allowed
+其他     blocked
+```
+
+masked logits：
+
+```text
+{           1.0
+hello      -inf
+"urgent"  -inf
+<eos>      -inf
+```
+
+采样结果：
+
+```text
+{
+```
+
+grammar 接受 `{`，状态前进。
+
+### 第 1 步：已经生成 `{`
+
+grammar state：
+
+```text
+需要 required 字段 "priority"
+```
+
+mask：
+
+```text
+"priority" allowed
+空白 token 可能 allowed
+其他 blocked
+```
+
+采样结果：
+
+```text
+"priority"
+```
+
+状态前进。
+
+### 第 2 步：已经生成 `{"priority"`
+
+grammar state：
+
+```text
+需要冒号
+```
+
+mask：
+
+```text
+: allowed
+其他 blocked
+```
+
+采样结果：
+
+```text
+:
+```
+
+状态前进。
+
+### 第 3 步：已经生成 `{"priority":`
+
+grammar state：
+
+```text
+需要 enum: "low" | "medium" | "high"
+```
+
+模型 logits：
+
+```text
+"urgent"  9.0
+"high"    5.0
+"medium"  3.0
+"low"     2.0
+hello     7.0
+```
+
+mask：
+
+```text
+"low"     allowed
+"medium"  allowed
+"high"    allowed
+"urgent"  blocked
+hello     blocked
+```
+
+masked logits：
+
+```text
+"urgent" -inf
+"high"    5.0
+"medium"  3.0
+"low"     2.0
+hello    -inf
+```
+
+采样结果可能是：
+
+```text
+"high"
+```
+
+注意这里模型原本最想输出 `"urgent"`，但 schema 不允许，所以采样器根本不会看到它。
+
+### 第 4 步：结束 object
+
+grammar state：
+
+```text
+字段已满足，可以结束 object
+```
+
+mask：
+
+```text
+} allowed
+可能还有合法空白
+其他 blocked
+```
+
+最终输出：
+
+```json
+{"priority":"high"}
+```
+
+这个输出的结构合法，不是因为模型内部真的“理解了 JSON Schema 的所有规则”，而是因为非法路径在每一步都被剪掉了。
+
+---
+
+## 8. 这和编译原理的关系
+
+你的直觉是对的：这很像编译原理。
+
+但要小心三层 token 的区别。
+
+| 层 | 例子 | 谁使用 |
+|---|---|---|
+| 字符 | `{`, `"`, `p`, `r` | JSON / regex 原始语法 |
+| 编译器 token | `LBRACE`, `STRING`, `COLON` | 传统 lexer / parser |
+| LLM token | `"priority"`, `": "`, ` high` | tokenizer / 模型词表 |
+
+传统编译器通常是：
+
+```text
+字符流
+  ↓ lexer
+词法 token
+  ↓ parser
+AST
+```
+
+约束解码更像：
+
+```text
+目标语法 / schema / regex
+  ↓ 编译成可增量匹配的状态机
+当前已生成 LLM tokens
+  ↓ detokenize / matcher state
+计算下一批合法 LLM token ids
+  ↓
+token mask
+```
+
+regex 约束偏词法自动机：
+
+```text
+正则 -> NFA/DFA -> 当前状态 -> 下一字符集合 -> 下一 token 集合
+```
+
+JSON Schema / grammar 偏语法分析：
+
+```text
+语法规则 -> parser state -> 当前可接受 terminal -> 下一 token 集合
+```
+
+区别在于：LLM 不是一个字符一个字符生成。它一次选择一个 tokenizer token。这个 token 可能包含多个字符，甚至包含半个词、前导空格、引号和冒号。
+
+所以约束解码要解决的是：
+
+```text
+如果现在选择这个 token，
+把它拼到当前输出后，
+是否仍可能走到一个合法终态？
+```
+
+这就是为什么 xgrammar 需要 tokenizer info，也就是为什么 vLLM 的 `XgrammarBackend` 初始化时先处理 tokenizer，再创建 grammar compiler。[S6]
+
+---
+
+## 9. 约束解码能保证什么
+
+它能强力保证结构性质。
+
+比如：
+
+```text
+JSON 是否能 parse
+required 字段是否出现
+字段类型是否匹配
+enum 是否在集合内
+regex 是否匹配
+grammar 是否接受
+工具调用参数是否满足 schema 的可解析形状
+```
+
+它不能保证语义性质。
+
+比如：
+
+```text
+工具是否选对
+参数值是否真实
+字段是否来自原文而不是模型猜测
+权限是否合理
+业务动作是否安全
+事实是否正确
+```
+
+这不是约束解码的失败，而是它的职责边界。
+
+可以把一次工具调用拆成三层：
+
+```text
+模型：
+理解意图，决定是否调用工具，填参数语义。
+
+约束解码：
+保证输出形状满足 schema，可被 parser 解析。
+
+运行时：
+权限、审计、幂等、超时、重试、业务校验。
+```
+
+约束解码解决的是“结构合法”，不是“任务正确”。
+
+这也是为什么 tiny random 模型不适合研究 structured output 的能力效果。它可以在 mask 帮助下输出合法结构，但字段内容没有可靠语义。我们后来换成 `Qwen/Qwen2.5-0.5B-Instruct`，是因为它足够小，同时有基本指令跟随能力。
+
+---
+
+## 10. 为什么复杂 schema 可能出问题
+
+我们本地实验里有一个值得记下的现象：
+
+```text
+扁平 JSON Schema + enum 可以跑通。
+Pydantic 生成的复杂 schema 曾经让请求长时间不返回。
+```
+
+这不应该被泛化成“xgrammar 不支持复杂 schema”或“vLLM 有 bug”这种大结论。它只是说明一个工程现实：
+
+```text
+schema 复杂度、backend 支持范围、tokenizer、CPU/GPU 路径、speculative decoding 和版本组合，都会影响 structured output 的行为。
+```
+
+从源码看，vLLM 不是只有一个 structured output backend。`StructuredOutputManager` 可选择 `xgrammar`、`guidance`、`outlines` 和 `lm-format-enforcer`。[S4]
+
+但我们本地还观察到：
+
+```text
+lm-format-enforcer 在当前源码版本与已安装包组合下会导入旧路径失败。
+```
+
+所以研究源码时，不要把“文档列出的 backend”直接等同于“当前环境都能无缝跑通”。应该像我们这次一样：
+
+```text
+固定模型
+固定 backend
+固定 schema 复杂度
+从最小可运行例子逐步扩大
+```
+
+建议研究顺序：
+
+```text
+choice
+  ↓
+regex
+  ↓
+扁平 json_schema
+  ↓
+enum
+  ↓
+array / nested object
+  ↓
+$defs / $ref / Pydantic schema
+  ↓
+structural_tag / tool calling
+```
+
+每一步都确认：
+
+```text
+能否编译 grammar？
+是否能快速生成 bitmask？
+是否能正确 apply 到 logits？
+生成后 grammar state 是否正常 advance？
+```
+
+---
+
+## 11. 读源码时抓住四个对象
+
+读 vLLM structured outputs 时，先不要陷入所有调度细节。先抓住四个对象。
+
+### 11.1 `StructuredOutputRequest`
+
+它是 request-local 的结构化输出元数据。
+
+关键问题：
+
+```text
+这个请求有没有 structured output？
+约束类型是什么？
+grammar 编译好了吗？
+```
+
+源码入口：
+
+```text
+vllm/v1/structured_output/request.py
+```
+
+### 11.2 `StructuredOutputManager`
+
+它是 engine-level manager。
+
+关键问题：
+
+```text
+选哪个 backend？
+什么时候编译 grammar？
+什么时候为 batch 填 bitmask？
+是否需要 reasoning parser 相关 gating？
+```
+
+源码入口：
+
+```text
+vllm/v1/structured_output/__init__.py
+```
+
+### 11.3 `XgrammarBackend` / `XgrammarGrammar`
+
+这是我们本地跑通的 backend。
+
+关键问题：
+
+```text
+tokenizer info 怎么构造？
+JSON Schema / regex / grammar 怎么编译？
+GrammarMatcher 怎么 fill bitmask / accept token / rollback？
+```
+
+源码入口：
+
+```text
+vllm/v1/structured_output/backend_xgrammar.py
+```
+
+### 11.4 `apply_grammar_bitmask`
+
+这是约束真正落到 logits 的地方。
+
+关键问题：
+
+```text
+bitmask 如何和 batch logits 对齐？
+CPU/GPU 路径有什么差异？
+非法 token 如何被应用到 logits？
+```
+
+源码入口：
+
+```text
+vllm/v1/structured_output/utils.py
+```
+
+把它们连起来：
+
+```text
+StructuredOutputRequest
+  ↓
+StructuredOutputManager.grammar_init
+  ↓
+XgrammarBackend.compile_grammar
+  ↓
+XgrammarGrammar.matcher
+  ↓
+StructuredOutputManager.grammar_bitmask
+  ↓
+apply_grammar_bitmask(logits, bitmask)
+  ↓
+sampler.sample
+  ↓
+grammar.accept_tokens
+```
+
+这条线比“vLLM 支持 JSON Schema 输出”更接近机制本身。
+
+---
+
+## 12. 最小伪实现
+
+下面是一段极简伪代码。它不是 vLLM 源码，但能表达 constrained decoding 的核心。
+
+```python
+ids = tokenizer.encode(prompt)
+grammar = compile_json_schema(schema, tokenizer)
+
+while True:
+    logits = model.forward(ids)[-1]       # shape: [vocab_size]
+
+    allowed = grammar.allowed_tokens()    # bool mask, shape: [vocab_size]
+    logits[~allowed] = float("-inf")
+
+    next_id = sample(logits)
+
+    if not grammar.accept(next_id):
+        raise RuntimeError("should not happen if mask was correct")
+
+    ids.append(next_id)
+
+    if next_id == eos_id or grammar.is_terminated():
+        break
+```
+
+真实 vLLM 会多很多东西：
+
+```text
+batch 中每个请求有自己的 grammar state
+prefill chunk 不需要每步 structured mask
+speculative decoding 需要 validate / rollback
+CPU/GPU bitmask 序列化和对齐
+streaming 输出要和 request status 协调
+reasoning 模型可能要等 reasoning 结束后再约束
+```
+
+但核心还是这几行：
+
+```python
+logits = model(...)
+mask = grammar.next_token_mask()
+logits[illegal] = -inf
+next_token = sample(logits)
+grammar.accept(next_token)
+```
+
+---
+
+## 13. 回到最初的问题
+
+### 解码器为什么能禁用不合法字符？
+
+更准确地说，它禁用的是不合法 token。
+
+因为模型输出的是整个词表的 logits，采样器还没有最终选择 token。约束解码可以在采样前把非法 token 的 logits 改成不可采样状态。
+
+### 解码器是模型的一部分吗？
+
+要区分两个“解码器”：
+
+```text
+decoder-only Transformer 里的 decoder blocks:
+模型结构的一部分。
+
+推理系统里的 decoding / sampler:
+模型外部的生成策略与运行时逻辑。
+```
+
+vLLM 的约束解码属于后者。
+
+### vLLM 为什么可以干涉模型行为？
+
+它不改模型权重，也不改 Transformer 内部计算。它控制的是：
+
+```text
+logits -> next token
+```
+
+这一步本来就由 serving runtime 负责。
+
+### 这是不是编译原理里的词法分析或语法分析？
+
+是相近的。
+
+```text
+regex 约束：更像词法自动机。
+grammar / JSON Schema：更像增量语法分析。
+```
+
+区别是：编译器最终处理的是字符或语言 token；LLM 约束解码最终必须落到 tokenizer token id 的 bitmask。
+
+---
+
+## 一页结论
+
+约束解码的完整心智模型可以压缩成：
+
+```text
+训练阶段：
+真实文本 -> token ids -> 模型 logits -> 和真实下一个 token 算 cross entropy
+
+普通推理：
+prompt -> token ids -> 模型 logits -> sampler 选 token -> append -> 循环
+
+约束推理：
+prompt -> token ids -> 模型 logits
+                  ↓
+       grammar/schema/regex 状态机
+                  ↓
+              token bitmask
+                  ↓
+       mask logits -> sampler 只在合法 token 中选
+                  ↓
+       grammar accept token -> 状态前进 -> 循环
+```
+
+这就是为什么 JSON Schema 可以限制模型输出：
+
+```text
+不是因为模型内部被临时改造，
+而是因为模型外部的推理循环始终控制着“下一 token 如何被选中”。
+```
+
+理解这一点之后，structured outputs、tool calling strict schema、regex 约束、grammar 约束就不是一组神秘功能，而是同一个机制的不同前端：
+
+```text
+把人类写的结构约束编译成状态机，
+再把状态机的“下一步合法集合”投影到模型词表上。
+```
+
+---
+
+## 参考源码
+
+- [S1: vLLM EngineCore `step()` 中模型执行、grammar bitmask 与 sampling 的关系](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/engine/core.py#L443-L463)
+- [S2: vLLM Sampler 的采样步骤说明](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/sample/sampler.py#L20-L58)
+- [S3: vLLM Sampler 中 allowed token ids mask 的 `-inf` 处理](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/sample/sampler.py#L395-L397)
+- [S4: vLLM `StructuredOutputManager` 的 backend 初始化与 grammar bitmask 填充](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/structured_output/__init__.py#L116-L300)
+- [S5: vLLM `apply_grammar_bitmask()` 将 grammar bitmask 应用到 logits](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/structured_output/utils.py#L44-L135)
+- [S6: vLLM `XgrammarBackend` 构造 tokenizer info 并编译 JSON Schema / regex / grammar](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/structured_output/backend_xgrammar.py#L34-L125)
+- [S7: vLLM structured output request key 生成逻辑](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/structured_output/request.py#L77-L97)
+- [S8: vLLM `XgrammarGrammar` 对 token 的 accept、validate、rollback 与 fill bitmask](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/structured_output/backend_xgrammar.py#L131-L199)
+- [S9: vLLM scheduler 收集 structured output 请求并获取 grammar bitmask](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/core/sched/scheduler.py#L1305-L1327)
+- [S10: vLLM scheduler 在采样后用 `accept_tokens()` 推进 grammar state](https://github.com/vllm-project/vllm/blob/e6fc848d4ff2d00759516b0c7a47ba640d44e4b2/vllm/v1/core/sched/scheduler.py#L1462-L1468)
